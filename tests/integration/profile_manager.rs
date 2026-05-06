@@ -29,7 +29,7 @@ fn create_test_hardware() -> HardwareInfo {
 #[tokio::test]
 async fn test_profile_manager_config_dir() {
     let config_dir = ProfileManager::config_dir();
-    assert!(config_dir.to_string_lossy().contains("llama.rs"));
+    assert!(config_dir.to_string_lossy().contains("llmr"));
 }
 
 #[tokio::test]

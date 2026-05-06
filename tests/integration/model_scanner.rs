@@ -149,7 +149,7 @@ fn test_model_scanner_paths_mixed() {
         .unwrap();
 
     let scanner = ModelScanner::new();
-    let models = scanner.scan_paths(&[model_path.clone()]);
+    let models = scanner.scan_paths(&[model_path]);
 
     assert!(!models.is_empty());
 }

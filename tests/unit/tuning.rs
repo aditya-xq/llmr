@@ -1,8 +1,9 @@
 use llmr::tuning::{
-    BenchmarkResult, BenchmarkRun, FlashAttn, GgufFacts, GpuLayerSpec,
-    HardwareProfile, KvCacheType, LlamaCppProfile, OptimizeOptions, SearchStrategy,
+    BenchmarkResult, BenchmarkRun, FlashAttn, GgufFacts, GgufFactsExtractor, GpuLayerSpec,
+    HardwareProfile, KvCacheType, LlamaCppProfile, OptimizeError, OptimizeOptions, SearchStrategy,
     SplitMode,
 };
+use std::io::Cursor;
 use std::path::PathBuf;
 
 fn create_test_hardware() -> HardwareProfile {
@@ -236,9 +237,15 @@ mod candidate_generation {
 
         let candidates = candidates::generate_gpu_offload_candidates(&profile, &hardware);
 
-        let has_auto = candidates.iter().any(|p| matches!(p.n_gpu_layers, GpuLayerSpec::Auto));
-        let has_all = candidates.iter().any(|p| matches!(p.n_gpu_layers, GpuLayerSpec::All));
-        let has_exact = candidates.iter().any(|p| matches!(p.n_gpu_layers, GpuLayerSpec::Exact(_)));
+        let has_auto = candidates
+            .iter()
+            .any(|p| matches!(p.n_gpu_layers, GpuLayerSpec::Auto));
+        let has_all = candidates
+            .iter()
+            .any(|p| matches!(p.n_gpu_layers, GpuLayerSpec::All));
+        let has_exact = candidates
+            .iter()
+            .any(|p| matches!(p.n_gpu_layers, GpuLayerSpec::Exact(_)));
 
         assert!(has_auto, "Should have Auto GPU layers");
         assert!(has_all, "Should have All GPU layers");
@@ -252,11 +259,12 @@ mod candidate_generation {
 
         let candidates = candidates::generate_kv_cache_candidates(&profile, &hardware);
 
-        let has_different_kv = candidates.iter().any(|p| {
-            p.cache_type_k != p.cache_type_v
-        });
+        let has_different_kv = candidates.iter().any(|p| p.cache_type_k != p.cache_type_v);
 
-        assert!(has_different_kv, "Should have candidates with different K and V cache types");
+        assert!(
+            has_different_kv,
+            "Should have candidates with different K and V cache types"
+        );
     }
 
     #[test]
@@ -292,7 +300,10 @@ mod candidate_generation {
         let has_cpu_mask = candidates.iter().any(|p| p.cpu_mask.is_some());
         let has_numa = candidates.iter().any(|p| p.numa.is_some());
 
-        assert!(has_cpu_mask || has_numa, "Should have CPU affinity candidates");
+        assert!(
+            has_cpu_mask || has_numa,
+            "Should have CPU affinity candidates"
+        );
     }
 
     #[test]
@@ -310,14 +321,32 @@ mod candidate_generation {
 }
 
 mod benchmark_determinism {
-    use crate::tuning::{BenchmarkResult, BenchmarkRun, LlamaCppProfile, create_test_profile};
+    use crate::tuning::{create_test_profile, BenchmarkResult, BenchmarkRun};
 
     #[test]
     fn test_benchmark_result_determinism() {
         let runs = vec![
-            BenchmarkRun { prompt_tps: 100.0, decode_tps: 50.0, latency_ms: 100.0, memory_mib: 2048, failed: false },
-            BenchmarkRun { prompt_tps: 101.0, decode_tps: 49.0, latency_ms: 99.0, memory_mib: 2047, failed: false },
-            BenchmarkRun { prompt_tps: 99.0, decode_tps: 51.0, latency_ms: 101.0, memory_mib: 2049, failed: false },
+            BenchmarkRun {
+                prompt_tps: 100.0,
+                decode_tps: 50.0,
+                latency_ms: 100.0,
+                memory_mib: 2048,
+                failed: false,
+            },
+            BenchmarkRun {
+                prompt_tps: 101.0,
+                decode_tps: 49.0,
+                latency_ms: 99.0,
+                memory_mib: 2047,
+                failed: false,
+            },
+            BenchmarkRun {
+                prompt_tps: 99.0,
+                decode_tps: 51.0,
+                latency_ms: 101.0,
+                memory_mib: 2049,
+                failed: false,
+            },
         ];
 
         let result1 = BenchmarkResult::from_runs(runs.clone()).unwrap();
@@ -385,9 +414,16 @@ mod regression_tests {
         facts.weight_bytes = 1_000_000_000;
 
         let hardware = create_test_hardware();
-        let feasibility = llmr::tuning::FeasibilityResult::estimate(&profile, &facts, &hardware);
+        let _feasibility = llmr::tuning::FeasibilityResult::estimate(&profile, &facts, &hardware);
+    }
 
-        assert!(feasibility.viable || !feasibility.viable);
+    #[allow(clippy::approx_constant)]
+    #[test]
+    fn test_read_f32() {
+        let data: Vec<u8> = f32::to_le_bytes(3.14).to_vec();
+        let mut cursor = Cursor::new(data);
+        let result = llmr::tuning::gguf::read_f32(&mut cursor).unwrap();
+        assert!((result - 3.14).abs() < 0.001);
     }
 
     #[test]
@@ -506,6 +542,19 @@ mod optimization_options {
     use super::*;
 
     #[test]
+    fn backend_support_status_marks_only_llama_cpp_supported() {
+        assert!(llmr::tuning::Backend::LlamaCpp.supports_serving());
+        assert_eq!(
+            llmr::tuning::Backend::LlamaCpp.support_status(),
+            "supported"
+        );
+        assert!(!llmr::tuning::Backend::Vllm.supports_serving());
+        assert_eq!(llmr::tuning::Backend::Vllm.support_status(), "planned");
+        assert!(!llmr::tuning::Backend::Sglang.supports_serving());
+        assert_eq!(llmr::tuning::Backend::Sglang.support_status(), "planned");
+    }
+
+    #[test]
     fn test_optimize_options_default() {
         let opts = OptimizeOptions::default();
 
@@ -555,7 +604,7 @@ mod feasibility_tests {
 
         let facts = create_test_gguf_facts();
         let mut hardware = create_test_hardware();
-        hardware.gpus[0].vram_bytes = 100_000_; // Very small
+        hardware.gpus[0].vram_bytes = 100_000; // Very small
 
         let result = llmr::tuning::FeasibilityResult::estimate(&profile, &facts, &hardware);
 
@@ -673,7 +722,7 @@ mod math_utils {
     fn test_variance_correct() {
         let values = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
         let result = llmr::tuning::variance(&values);
-        assert!((result - 4.571428571).abs() < 0.01);
+        assert!((result - 4.571_429).abs() < 0.01);
     }
 }
 
@@ -683,8 +732,20 @@ mod benchmark_result_edge_cases {
     #[test]
     fn test_from_runs_all_failed() {
         let runs = vec![
-            BenchmarkRun { prompt_tps: 0.0, decode_tps: 0.0, latency_ms: 0.0, memory_mib: 0, failed: true },
-            BenchmarkRun { prompt_tps: 0.0, decode_tps: 0.0, latency_ms: 0.0, memory_mib: 0, failed: true },
+            BenchmarkRun {
+                prompt_tps: 0.0,
+                decode_tps: 0.0,
+                latency_ms: 0.0,
+                memory_mib: 0,
+                failed: true,
+            },
+            BenchmarkRun {
+                prompt_tps: 0.0,
+                decode_tps: 0.0,
+                latency_ms: 0.0,
+                memory_mib: 0,
+                failed: true,
+            },
         ];
         let result = BenchmarkResult::from_runs(runs);
         assert!(result.is_none());
@@ -700,9 +761,27 @@ mod benchmark_result_edge_cases {
     #[test]
     fn test_from_runs_mixed_success_failure() {
         let runs = vec![
-            BenchmarkRun { prompt_tps: 100.0, decode_tps: 50.0, latency_ms: 100.0, memory_mib: 2048, failed: false },
-            BenchmarkRun { prompt_tps: 0.0, decode_tps: 0.0, latency_ms: 0.0, memory_mib: 0, failed: true },
-            BenchmarkRun { prompt_tps: 110.0, decode_tps: 55.0, latency_ms: 95.0, memory_mib: 2050, failed: false },
+            BenchmarkRun {
+                prompt_tps: 100.0,
+                decode_tps: 50.0,
+                latency_ms: 100.0,
+                memory_mib: 2048,
+                failed: false,
+            },
+            BenchmarkRun {
+                prompt_tps: 0.0,
+                decode_tps: 0.0,
+                latency_ms: 0.0,
+                memory_mib: 0,
+                failed: true,
+            },
+            BenchmarkRun {
+                prompt_tps: 110.0,
+                decode_tps: 55.0,
+                latency_ms: 95.0,
+                memory_mib: 2050,
+                failed: false,
+            },
         ];
         let result = BenchmarkResult::from_runs(runs).unwrap();
         assert_eq!(result.failure_count, 1);
@@ -759,6 +838,38 @@ mod benchmark_result_edge_cases {
         };
         let score = result.combined_score();
         assert!(score > 0.0);
+    }
+}
+
+mod search_error_handling {
+    use super::*;
+    use std::path::Path;
+
+    struct StaticExtractor;
+
+    impl GgufFactsExtractor for StaticExtractor {
+        fn extract(&self, _path: &Path) -> Result<GgufFacts, OptimizeError> {
+            Ok(create_test_gguf_facts())
+        }
+    }
+
+    #[test]
+    fn optimize_propagates_benchmark_errors() {
+        let result = llmr::tuning::optimize_llama_cpp_profile(
+            "test.gguf",
+            create_test_hardware(),
+            &StaticExtractor,
+            |_profile| Err(OptimizeError::Benchmark("docker unavailable".to_string())),
+            OptimizeOptions {
+                max_rounds: 1,
+                search_strategy: SearchStrategy::Fast,
+                ..OptimizeOptions::default()
+            },
+        );
+
+        assert!(
+            matches!(result, Err(OptimizeError::Benchmark(message)) if message == "docker unavailable")
+        );
     }
 }
 
@@ -927,6 +1038,7 @@ mod gguf_parsing_tests {
         assert_eq!(result, 42);
     }
 
+    #[allow(clippy::approx_constant)]
     #[test]
     fn test_read_f32() {
         let data: Vec<u8> = f32::to_le_bytes(3.14).to_vec();
@@ -935,6 +1047,7 @@ mod gguf_parsing_tests {
         assert!((result - 3.14).abs() < 0.001);
     }
 
+    #[allow(clippy::approx_constant)]
     #[test]
     fn test_read_f64() {
         let data: Vec<u8> = f64::to_le_bytes(2.71828).to_vec();
@@ -983,20 +1096,22 @@ mod candidate_generation_edge_cases {
 
     #[test]
     fn test_candidate_gpu_layers_range() {
-        let layers = llmr::tuning::candidate_gpu_layers(Some(32), 1, llmr::tuning::GpuLayerSpec::Exact(0));
+        let layers =
+            llmr::tuning::candidate_gpu_layers(Some(32), 1, llmr::tuning::GpuLayerSpec::Exact(0));
         assert!(!layers.is_empty());
     }
 
     #[test]
     fn test_candidate_kv_cache_types_includes_current() {
-        let types = llmr::tuning::candidate_kv_cache_types(&create_test_hardware(), KvCacheType::Q4_0);
+        let types =
+            llmr::tuning::candidate_kv_cache_types(&create_test_hardware(), KvCacheType::Q4_0);
         assert!(types.contains(&KvCacheType::Q4_0));
     }
 
     #[test]
     fn test_candidate_poll_includes_zero() {
         let poll = llmr::tuning::candidate_poll(None);
-        let has_zero = poll.iter().any(|&p| p == 0);
+        let has_zero = poll.contains(&0);
         assert!(has_zero, "candidate_poll should include 0 as valid option");
     }
 

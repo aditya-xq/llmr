@@ -29,7 +29,7 @@ fn create_test_hardware() -> llmr::hardware::HardwareInfo {
 fn test_profile_manager_new() {
     let _pm = ProfileManager::new();
     let config_dir = ProfileManager::config_dir();
-    assert!(config_dir.to_string_lossy().contains("llama.rs"));
+    assert!(config_dir.to_string_lossy().contains("llmr"));
 }
 
 #[tokio::test]

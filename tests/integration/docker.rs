@@ -51,7 +51,8 @@ async fn test_docker_image_exists() {
         return;
     };
     let exists = client.image_exists("nonexistent-image:latest").await;
-    assert!(!exists || exists);
+    #[allow(clippy::overly_complex_bool_expr)]
+    let _ = exists;
 }
 
 #[tokio::test]
@@ -94,7 +95,7 @@ async fn test_profile_to_docker_args_complete() {
     let hardware = create_test_hardware();
     let profile = Profile::new("test_model.gguf".to_string(), 4_000_000_000, &hardware);
 
-    let args = profile.to_docker_args(8080, true, false);
+    let args = profile.to_docker_args(8080, true, false).unwrap();
 
     assert!(args.contains(&"--name".to_string()));
     assert!(args.contains(&"-d".to_string()));

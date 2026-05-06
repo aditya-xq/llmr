@@ -5,4 +5,5 @@ pub mod logger;
 pub mod profile_integration;
 pub mod public_api;
 pub mod scanner;
+pub mod scanner_mock;
 pub mod tuning;
