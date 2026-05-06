@@ -1,5 +1,6 @@
 use crate::errors::{Error, Result};
 use crate::hardware::HardwareInfo;
+use crate::tuning::Backend;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -16,6 +17,8 @@ pub struct Profile {
     pub gpu_count: u32,
     pub gpu_vram_total_mb: u64,
     pub docker_image: String,
+    #[serde(default)]
+    pub backend: Backend,
     pub threads: u32,
     pub batch_size: u32,
     pub ubatch_size: u32,
@@ -33,6 +36,15 @@ pub struct Profile {
 
 impl Profile {
     pub fn new(model_file: String, model_size_bytes: u64, hardware: &HardwareInfo) -> Self {
+        Self::with_backend(model_file, model_size_bytes, hardware, Backend::default())
+    }
+
+    pub fn with_backend(
+        model_file: String,
+        model_size_bytes: u64,
+        hardware: &HardwareInfo,
+        backend: Backend,
+    ) -> Self {
         let cpu_cores = hardware.cpu.cores;
         let threads = Self::compute_threads(cpu_cores, hardware.cpu.threads);
         let batch_size = Self::compute_batch_size(&hardware.gpu);
@@ -41,7 +53,7 @@ impl Profile {
         let split_mode = Self::compute_split_mode(&hardware.gpu, hardware.has_nvlink);
         let context_size = Self::compute_context_size(hardware.ram.free_gb);
         let (cache_type_k, cache_type_v) = Self::compute_cache_types(&hardware.gpu);
-        let docker_image = Self::select_docker_image(&hardware.gpu);
+        let docker_image = Self::select_docker_image(&hardware.gpu, backend);
         let gpu_type = Self::hardware_gpu_type(hardware);
 
         Self {
@@ -59,6 +71,7 @@ impl Profile {
                 .map(|g| g.vram_mb.iter().sum())
                 .unwrap_or(0),
             docker_image,
+            backend,
             threads,
             batch_size,
             ubatch_size,
@@ -157,21 +170,62 @@ impl Profile {
         }
     }
 
-    pub fn select_docker_image(gpu: &Option<crate::hardware::GpuInfo>) -> String {
-        let registry = "ghcr.io/ggml-org/llama.cpp";
+    pub fn select_docker_image(gpu: &Option<crate::hardware::GpuInfo>, backend: Backend) -> String {
+        let registry = backend.docker_registry();
+        match backend {
+            Backend::LlamaCpp => Self::select_llama_cpp_image(gpu, registry),
+            Backend::Vllm => Self::select_vllm_image(gpu, registry),
+            Backend::Sglang => Self::select_sglang_image(gpu, registry),
+        }
+    }
+
+    fn select_llama_cpp_image(gpu: &Option<crate::hardware::GpuInfo>, registry: &str) -> String {
+        let base = format!("{}/llama.cpp", registry);
         match gpu {
             Some(g) if g.type_ == "nvidia" => {
                 let driver_ver = Self::get_nvidia_driver_version();
                 if driver_ver >= 550 {
-                    format!("{registry}:server-cuda13")
+                    format!("{}:server-cuda13", base)
                 } else {
-                    format!("{registry}:server-cuda")
+                    format!("{}:server-cuda", base)
                 }
             }
-            Some(g) if g.type_ == "amd" => format!("{registry}:server-rocm"),
-            Some(g) if g.type_ == "intel" => format!("{registry}:server-intel"),
-            Some(g) if g.type_ == "vulkan" => format!("{registry}:server-vulkan"),
-            _ => format!("{registry}:server"),
+            Some(g) if g.type_ == "amd" => format!("{}:server-rocm", base),
+            Some(g) if g.type_ == "intel" => format!("{}:server-intel", base),
+            Some(g) if g.type_ == "vulkan" => format!("{}:server-vulkan", base),
+            _ => format!("{}:server", base),
+        }
+    }
+
+    fn select_vllm_image(gpu: &Option<crate::hardware::GpuInfo>, registry: &str) -> String {
+        let base = format!("{}/vllm", registry);
+        match gpu {
+            Some(g) if g.type_ == "nvidia" => {
+                let driver_ver = Self::get_nvidia_driver_version();
+                if driver_ver >= 550 {
+                    format!("{}:latest-cuda13", base)
+                } else {
+                    format!("{}:latest-cuda12", base)
+                }
+            }
+            Some(g) if g.type_ == "amd" => format!("{}:latest-rocm", base),
+            _ => format!("{}:latest", base),
+        }
+    }
+
+    fn select_sglang_image(gpu: &Option<crate::hardware::GpuInfo>, registry: &str) -> String {
+        let base = format!("{}/sglang", registry);
+        match gpu {
+            Some(g) if g.type_ == "nvidia" => {
+                let driver_ver = Self::get_nvidia_driver_version();
+                if driver_ver >= 550 {
+                    format!("{}:latest-cuda13", base)
+                } else {
+                    format!("{}:latest-cuda12", base)
+                }
+            }
+            Some(g) if g.type_ == "amd" => format!("{}:latest-rocm", base),
+            _ => format!("{}:latest", base),
         }
     }
 
@@ -208,7 +262,7 @@ impl Profile {
         matches!(gpu_type, "nvidia" | "amd" | "intel" | "vulkan")
     }
 
-    fn uses_gpu_image(&self) -> bool {
+    pub fn uses_gpu_image(&self) -> bool {
         Self::is_gpu_image(&self.docker_image)
     }
 
@@ -273,8 +327,15 @@ impl Profile {
         Ok(())
     }
 
-    pub fn to_docker_args(&self, port: u16, enable_metrics: bool, public: bool) -> Vec<String> {
+    pub fn to_docker_args(
+        &self,
+        port: u16,
+        enable_metrics: bool,
+        public: bool,
+    ) -> Result<Vec<String>> {
+        self.ensure_backend_supported()?;
         let mut args = Vec::new();
+        let container_port = self.container_port()?;
 
         args.push("--name".to_string());
         args.push(self.container_name());
@@ -282,10 +343,10 @@ impl Profile {
 
         if public {
             args.push("-p".to_string());
-            args.push(format!("{}:8080", port));
+            args.push(format!("{}:{}", port, container_port));
         } else {
             args.push("-p".to_string());
-            args.push(format!("127.0.0.1:{}:8080", port));
+            args.push(format!("127.0.0.1:{}:{}", port, container_port));
         }
 
         if self.uses_gpu_image() {
@@ -303,9 +364,57 @@ impl Profile {
 
         args.push(self.docker_image.clone());
 
-        args.extend(self.llama_server_args(enable_metrics));
+        args.extend(self.server_args(enable_metrics)?);
 
-        args
+        Ok(args)
+    }
+
+    pub fn container_port(&self) -> Result<u16> {
+        self.ensure_backend_supported()?;
+        match self.backend {
+            Backend::LlamaCpp => Ok(8080),
+            Backend::Vllm | Backend::Sglang => Err(Error::InvalidProfile {
+                reason: self.backend.unsupported_message(),
+            }),
+        }
+    }
+
+    pub fn server_args(&self, enable_metrics: bool) -> Result<Vec<String>> {
+        self.ensure_backend_supported()?;
+        match self.backend {
+            Backend::LlamaCpp => Ok(self.llama_server_args(enable_metrics)),
+            Backend::Vllm | Backend::Sglang => Err(Error::InvalidProfile {
+                reason: self.backend.unsupported_message(),
+            }),
+        }
+    }
+
+    pub fn server_args_for_mode(
+        &self,
+        enable_metrics: bool,
+        enable_gpu: bool,
+    ) -> Result<Vec<String>> {
+        let mut server_args = self.server_args(enable_metrics)?;
+        if enable_gpu {
+            return Ok(server_args);
+        }
+
+        if let Some(pos) = server_args.iter().position(|arg| arg == "--n-gpu-layers") {
+            server_args.remove(pos);
+            server_args.remove(pos);
+        }
+        server_args.extend(["--n-gpu-layers".to_string(), "0".to_string()]);
+        Ok(server_args)
+    }
+
+    fn ensure_backend_supported(&self) -> Result<()> {
+        if self.backend.supports_serving() {
+            return Ok(());
+        }
+
+        Err(Error::InvalidProfile {
+            reason: self.backend.unsupported_message(),
+        })
     }
 
     pub fn llama_server_args(&self, enable_metrics: bool) -> Vec<String> {
@@ -363,21 +472,11 @@ impl Profile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelCache {
     pub model_paths: Vec<String>,
     pub scan_timestamp: String,
     pub scanned_folders: Vec<String>,
-}
-
-impl Default for ModelCache {
-    fn default() -> Self {
-        Self {
-            model_paths: Vec::new(),
-            scan_timestamp: String::new(),
-            scanned_folders: Vec::new(),
-        }
-    }
 }
 
 pub struct ProfileManager {
@@ -394,7 +493,7 @@ impl ProfileManager {
     pub fn config_dir() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("llama.rs")
+            .join("llmr")
     }
 
     pub fn new_with_dir(config_dir: PathBuf) -> Self {
@@ -622,15 +721,15 @@ impl ProfileManager {
     }
 
     pub fn find_free_port(start: u16) -> u16 {
-    for port in start..start + 50 {
-        if std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
-            return port;
+        for port in start..start + 50 {
+            if std::net::TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok() {
+                return port;
+            }
         }
+        start
     }
-    start
-}
 
-fn generate_key(&self, model_path: &str, hardware: &HardwareInfo) -> String {
+    fn generate_key(&self, model_path: &str, hardware: &HardwareInfo) -> String {
         let model_basename = Path::new(model_path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -976,20 +1075,21 @@ mod tests {
         });
 
         let no_gpu: Option<GpuInfo> = None;
+        let backend = Backend::LlamaCpp;
 
-        let nvidia_img = Profile::select_docker_image(&nvidia_gpu);
+        let nvidia_img = Profile::select_docker_image(&nvidia_gpu, backend);
         assert!(nvidia_img.contains("cuda"));
 
-        let amd_img = Profile::select_docker_image(&amd_gpu);
+        let amd_img = Profile::select_docker_image(&amd_gpu, backend);
         assert!(amd_img.contains("rocm"));
 
-        let intel_img = Profile::select_docker_image(&intel_gpu);
+        let intel_img = Profile::select_docker_image(&intel_gpu, backend);
         assert!(intel_img.contains("intel"));
 
-        let vulkan_img = Profile::select_docker_image(&vulkan_gpu);
+        let vulkan_img = Profile::select_docker_image(&vulkan_gpu, backend);
         assert!(vulkan_img.contains("vulkan"));
 
-        let cpu_img = Profile::select_docker_image(&no_gpu);
+        let cpu_img = Profile::select_docker_image(&no_gpu, backend);
         assert!(cpu_img.contains("server"));
         assert!(!cpu_img.contains("cuda"));
     }
@@ -1087,7 +1187,7 @@ mod tests {
         let hardware = create_test_hardware();
         let profile = Profile::new("test_model.gguf".to_string(), 4_000_000_000, &hardware);
 
-        let args = profile.to_docker_args(8080, true, false);
+        let args = profile.to_docker_args(8080, true, false).unwrap();
 
         assert!(args.contains(&"--name".to_string()));
         assert!(args.contains(&"-d".to_string()));
@@ -1100,7 +1200,7 @@ mod tests {
         let hardware = create_test_hardware();
         let profile = Profile::new("test_model.gguf".to_string(), 4_000_000_000, &hardware);
 
-        let args = profile.to_docker_args(8080, false, false);
+        let args = profile.to_docker_args(8080, false, false).unwrap();
 
         assert!(args.windows(2).any(|pair| pair == ["--gpus", "all"]));
     }
@@ -1110,7 +1210,7 @@ mod tests {
         let hardware = create_test_hardware();
         let profile = Profile::new("test_model.gguf".to_string(), 4_000_000_000, &hardware);
 
-        let args = profile.to_docker_args(9000, false, true);
+        let args = profile.to_docker_args(9000, false, true).unwrap();
 
         assert!(args.contains(&"9000:8080".to_string()));
     }
@@ -1131,6 +1231,21 @@ mod tests {
         assert!(args.contains(&"--ubatch-size".to_string()));
         assert!(args.contains(&"--parallel".to_string()));
         assert!(args.contains(&"--cont-batching".to_string()));
+    }
+
+    #[test]
+    fn test_planned_backend_server_args_are_explicitly_unsupported() {
+        let hardware = create_test_hardware();
+        let profile = Profile::with_backend(
+            "test_model.gguf".to_string(),
+            4_000_000_000,
+            &hardware,
+            Backend::Vllm,
+        );
+
+        let err = profile.to_docker_args(8080, false, false).unwrap_err();
+        assert!(err.to_string().contains("planned"));
+        assert!(err.to_string().contains("llama.cpp"));
     }
 
     #[test]
@@ -1194,7 +1309,7 @@ mod tests {
     fn test_profile_manager_new() {
         let _pm = ProfileManager::new();
         let config_dir = ProfileManager::config_dir();
-        assert!(config_dir.to_string_lossy().contains("llama.rs"));
+        assert!(config_dir.to_string_lossy().contains("llmr"));
     }
 
     #[test]

@@ -3,11 +3,63 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub mod gguf;
 pub mod candidates;
+pub mod gguf;
 pub mod search;
 
 pub use search::SearchStats;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Backend {
+    #[default]
+    LlamaCpp,
+    Vllm,
+    Sglang,
+}
+
+impl Backend {
+    pub const ACTIVE: Self = Self::LlamaCpp;
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Backend::LlamaCpp => "llama.cpp",
+            Backend::Vllm => "vLLM",
+            Backend::Sglang => "SGLang",
+        }
+    }
+
+    pub fn support_status(&self) -> &'static str {
+        match self {
+            Backend::LlamaCpp => "supported",
+            Backend::Vllm | Backend::Sglang => "planned",
+        }
+    }
+
+    pub fn supports_serving(&self) -> bool {
+        matches!(self, Backend::LlamaCpp)
+    }
+
+    pub fn unsupported_message(&self) -> String {
+        format!(
+            "{} support is planned but not wired for serve/tune yet. Current releases only run llama.cpp.",
+            self.display_name()
+        )
+    }
+
+    pub fn docker_registry(&self) -> &'static str {
+        match self {
+            Backend::LlamaCpp => "ghcr.io/ggml-org",
+            Backend::Vllm => "ghcr.io/vllm-project",
+            Backend::Sglang => "ghcr.io/lm-sys",
+        }
+    }
+}
+
+impl fmt::Display for Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
 
 impl From<crate::hardware::HardwareInfo> for HardwareProfile {
     fn from(info: crate::hardware::HardwareInfo) -> Self {
@@ -435,7 +487,10 @@ impl LlamaCppProfile {
 
     pub fn candidate_key(&self) -> CandidateKey {
         let tensor_split_str = self.tensor_split.as_ref().map(|v| {
-            v.iter().map(|f| format!("{:.6}", f)).collect::<Vec<_>>().join(",")
+            v.iter()
+                .map(|f| format!("{:.6}", f))
+                .collect::<Vec<_>>()
+                .join(",")
         });
         CandidateKey {
             ctx_size: self.ctx_size,
@@ -514,7 +569,7 @@ pub struct CandidateKey {
 
 impl CandidateKey {
     pub fn fingerprint(&self) -> String {
-        let ts = self.tensor_split.as_ref().map(|v| v.clone()).unwrap_or_default();
+        let ts = self.tensor_split.clone().unwrap_or_default();
         format!(
             "ctx={};b={};ub={};t={};tb={};np={};ngl={:?};sm={:?};ts={};mg={:?};fa={:?};ctk={:?};ctv={:?};kvo={};rep={};mmap={};mlock={};numa={:?};cb={};nh={};poll={:?};pollb={:?};cpu_mask={:?};cpu_range={:?};cpu_strict={};draft={};draft_ngl={:?};draft_t={};draft_cache={:?};spec={:?};spec_extra={:?};fit={};fitt={:?}",
             self.ctx_size, self.batch_size, self.ubatch_size, self.threads, self.threads_batch,
@@ -585,18 +640,13 @@ impl Default for OptimizeOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SearchStrategy {
     Greedy,
+    #[default]
     Racing,
     Exhaustive,
     Fast,
-}
-
-impl Default for SearchStrategy {
-    fn default() -> Self {
-        Self::Racing
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -644,21 +694,11 @@ pub struct LearnReason {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LearnedProfile {
     pub overrides: std::collections::HashMap<String, String>,
     pub reasons: Vec<LearnReason>,
     pub baseline_fingerprint: String,
-}
-
-impl Default for LearnedProfile {
-    fn default() -> Self {
-        Self {
-            overrides: std::collections::HashMap::new(),
-            reasons: vec![],
-            baseline_fingerprint: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -718,7 +758,15 @@ impl BenchmarkResult {
         let latency_score = 1000.0 / (self.latency_ms + 1.0);
         let stability_weight = 0.25;
         let variance_penalty = self.variance_penalty();
-        tps * (1.0 - stability_weight) * (1.0 - variance_penalty) + latency_score * stability_weight * 10.0
+        tps * (1.0 - stability_weight) * (1.0 - variance_penalty)
+            + latency_score * stability_weight * 10.0
+    }
+
+    pub fn throughput_score(&self) -> f32 {
+        let tps = self.prompt_tps * 0.25 + self.decode_tps * 0.75;
+        let stability_weight = 0.15;
+        let variance_penalty = self.variance_penalty();
+        tps * (1.0 - stability_weight) * (1.0 - variance_penalty)
     }
 
     pub fn variance_penalty(&self) -> f32 {
@@ -771,9 +819,7 @@ pub fn variance(values: &[f32]) -> f32 {
         return 0.0;
     }
     let mean = values.iter().sum::<f32>() / values.len() as f32;
-    values.iter()
-        .map(|v| (v - mean).powi(2))
-        .sum::<f32>() / (values.len() - 1) as f32
+    values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / (values.len() - 1) as f32
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -804,6 +850,10 @@ impl SearchCache {
 
     pub fn len(&self) -> usize {
         self.results.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.results.is_empty()
     }
 }
 
@@ -858,12 +908,13 @@ impl FeasibilityResult {
                 GpuLayerSpec::Auto => facts.block_count.unwrap_or(0),
             };
 
-            let offloaded_weight_bytes = if offloaded_layers > 0 && facts.block_count.unwrap_or(0) > 0 {
-                let ratio = offloaded_layers as f64 / facts.block_count.unwrap_or(1) as f64;
-                (weight_bytes as f64 * ratio) as u64
-            } else {
-                0
-            };
+            let offloaded_weight_bytes =
+                if offloaded_layers > 0 && facts.block_count.unwrap_or(0) > 0 {
+                    let ratio = offloaded_layers as f64 / facts.block_count.unwrap_or(1) as f64;
+                    (weight_bytes as f64 * ratio) as u64
+                } else {
+                    0
+                };
 
             let gpu_memory_needed = offloaded_weight_bytes + kv_cache_bytes + batch_buffer_bytes;
 
@@ -961,7 +1012,8 @@ pub fn estimate_batch_buffer_bytes(profile: &LlamaCppProfile, facts: &GgufFacts)
     let layers = facts.block_count.unwrap_or(32) as u64;
 
     let bytes_per_token = hidden.saturating_mul(2);
-    batch.saturating_mul(ctx)
+    batch
+        .saturating_mul(ctx)
         .saturating_mul(bytes_per_token)
         .saturating_mul(layers)
         .saturating_div(8)
@@ -1001,8 +1053,7 @@ pub fn estimate_max_gpu_layers(
         return total_layers;
     }
 
-    let max_layers = (available_for_weights / per_layer_bytes).min(total_layers as u64) as u32;
-    max_layers.max(0)
+    (available_for_weights / per_layer_bytes).min(total_layers as u64) as u32
 }
 
 pub fn is_context_plausible(facts: &GgufFacts, ctx_size: u32) -> bool {
@@ -1021,7 +1072,9 @@ fn estimate_max_plausible_context(facts: &GgufFacts) -> u32 {
         _ => base_ctx,
     };
 
-    let original_ctx = facts.rope_scaling_original_context_length.unwrap_or(base_ctx as u32) as u64;
+    let original_ctx = facts
+        .rope_scaling_original_context_length
+        .unwrap_or(base_ctx as u32) as u64;
 
     rope_scaling.max(original_ctx).min(1_000_000) as u32
 }
@@ -1139,13 +1192,25 @@ where
     best.notes.push(ReasonTag::SeededFromMetadata.to_string());
     best.notes.push(format!(
         "prompt_tps={:.1}, decode_tps={:.1}, latency={:.0}ms",
-        best.estimated_result.as_ref().map(|r| r.prompt_tps).unwrap_or(0.0),
-        best.estimated_result.as_ref().map(|r| r.decode_tps).unwrap_or(0.0),
-        best.estimated_result.as_ref().map(|r| r.latency_ms).unwrap_or(0.0)
+        best.estimated_result
+            .as_ref()
+            .map(|r| r.prompt_tps)
+            .unwrap_or(0.0),
+        best.estimated_result
+            .as_ref()
+            .map(|r| r.decode_tps)
+            .unwrap_or(0.0),
+        best.estimated_result
+            .as_ref()
+            .map(|r| r.latency_ms)
+            .unwrap_or(0.0)
     ));
 
     best.facts = facts;
-    Ok(OptimizeResult { profile: best, stats })
+    Ok(OptimizeResult {
+        profile: best,
+        stats,
+    })
 }
 
 fn seed_profile(
@@ -1197,8 +1262,8 @@ fn seed_profile(
     LlamaCppProfile {
         model_path,
         ctx_size,
-        batch_size: 512,
-        ubatch_size: 128,
+        batch_size: 2048,
+        ubatch_size: 512,
         threads,
         threads_batch,
         parallel: opts.parallel_requests.max(1),
@@ -1215,17 +1280,17 @@ fn seed_profile(
         tensor_split,
         main_gpu: hardware.gpus.first().map(|g| g.index),
         flash_attn: if has_gpu {
-            FlashAttn::Auto
+            FlashAttn::On
         } else {
             FlashAttn::Off
         },
         cache_type_k: if has_gpu {
-            KvCacheType::F16
+            KvCacheType::Q8_0
         } else {
             KvCacheType::F32
         },
         cache_type_v: if has_gpu {
-            KvCacheType::F16
+            KvCacheType::Q8_0
         } else {
             KvCacheType::F32
         },
@@ -1437,7 +1502,7 @@ fn coordinate_variants(
             let mut p = best.clone();
             p.spec_type = Some(spec);
             if spec == SpecType::NGram {
-                p.spec_extra = Some(format!("n={}", (opts.generation_tokens / 4).min(8).max(2)));
+                p.spec_extra = Some(format!("n={}", (opts.generation_tokens / 4).clamp(2, 8)));
             }
             out.push(p);
         }
@@ -1478,8 +1543,10 @@ pub fn candidate_batches(current: u32) -> Vec<u32> {
         next_pow2(current / 2, 4096).max(32),
         next_pow2(current.saturating_mul(2), 4096),
         256,
+        512,
         1024,
         2048,
+        4096,
     ])
 }
 
@@ -1493,6 +1560,7 @@ pub fn candidate_ubatches(current: u32, batch: u32) -> Vec<u32> {
         128,
         256,
         512,
+        1024,
     ])
     .into_iter()
     .map(|v| v.min(batch.max(1)))
@@ -1533,7 +1601,10 @@ fn candidate_flash_attn(hardware: &HardwareProfile, current: FlashAttn) -> Vec<F
     ])
 }
 
-pub fn candidate_kv_cache_types(hardware: &HardwareProfile, current: KvCacheType) -> Vec<KvCacheType> {
+pub fn candidate_kv_cache_types(
+    hardware: &HardwareProfile,
+    current: KvCacheType,
+) -> Vec<KvCacheType> {
     let has_gpu = !hardware.gpus.is_empty();
     if !has_gpu {
         return vec![KvCacheType::F32];
@@ -1563,22 +1634,11 @@ pub fn candidate_cont_batching(current: bool, opts: &OptimizeOptions) -> Vec<boo
 }
 
 pub fn candidate_poll(current: Option<u32>) -> Vec<u32> {
-    dedupe_u32(vec![
-        current.unwrap_or(0),
-        0,
-        32,
-        64,
-        128,
-    ])
+    dedupe_u32(vec![current.unwrap_or(0), 0, 32, 64, 128])
 }
 
 fn candidate_poll_batch(current: Option<u32>) -> Vec<u32> {
-    dedupe_u32(vec![
-        current.unwrap_or(0),
-        0,
-        32,
-        64,
-    ])
+    dedupe_u32(vec![current.unwrap_or(0), 0, 32, 64])
 }
 
 fn candidate_cpu_mask(hardware: &HardwareProfile) -> Vec<String> {

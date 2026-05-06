@@ -1,16 +1,71 @@
 use super::args::*;
+use crate::bench::config;
+use crate::bench::types::BenchmarkConfig;
 use crate::diagnostics::{print_diagnostic_results, DockerCheck, EnvCheck, HardwareCheck};
 use crate::docker::DockerClient;
 use crate::errors::{Error, Result};
 use crate::hardware::HardwareInfo;
 use crate::models::{ModelScanner, Profile, ProfileManager};
-use crate::tuning::{GgufExtractor, GgufFactsExtractor, HardwareProfile, LlamaCppProfile, OptimizeOptions, OptimizeError};
+use crate::tuning::{
+    Backend, GgufExtractor, GgufFactsExtractor, HardwareProfile, LlamaCppProfile, OptimizeError,
+    OptimizeOptions,
+};
 use crate::utils::Style;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{info, warn};
+
+async fn ensure_docker(style: &Style) -> Result<DockerClient> {
+    let install_status = DockerClient::check_installed();
+
+    if !install_status.is_installed() {
+        return Err(Error::Other {
+            message: "Docker is not installed. Please install Docker to continue.".to_string(),
+        });
+    }
+
+    let diag = DockerClient::diagnose().await;
+
+    if diag.daemon_running {
+        return DockerClient::new();
+    }
+
+    println!(
+        "  {} Docker installed but daemon not running, attempting to start...",
+        style.info("→")
+    );
+    std::io::stdout().flush()?;
+
+    if let Err(e) = DockerClient::start_daemon().await {
+        return Err(Error::Other {
+            message: format!(
+                "Docker is installed but not running. Please start Docker manually: {}",
+                e
+            ),
+        });
+    }
+
+    println!(
+        "  {} Waiting for Docker daemon to be ready...",
+        style.info("→")
+    );
+    std::io::stdout().flush()?;
+
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let diag = DockerClient::diagnose().await;
+        if diag.daemon_running {
+            println!("  {} Docker daemon is ready", style.success("✓"));
+            return DockerClient::new();
+        }
+    }
+
+    Err(Error::Other {
+        message: "Docker daemon did not start in time. Please start Docker manually.".to_string(),
+    })
+}
 
 pub struct ServeCommand {
     args: ServeArgs,
@@ -31,10 +86,7 @@ impl ServeCommand {
             match self.interactive_model_select().await? {
                 Some(p) => p,
                 None => {
-                    println!(
-                        "{}",
-                        style.error("No model selected")
-                    );
+                    println!("{}", style.error("No model selected"));
                     return Ok(());
                 }
             }
@@ -52,14 +104,22 @@ impl ServeCommand {
         let is_new_profile = !profile_manager
             .profile_exists(&model_path, &hardware)
             .await?;
+        let mut docker_client = None;
 
-        let mut profile = if is_new_profile && !self.args.dry_run && !self.args.no_benchmark && !self.args.quick {
+        let mut profile = if is_new_profile
+            && !self.args.dry_run
+            && !self.args.no_benchmark
+            && !self.args.quick
+        {
             let run_tuning = if self.args.benchmark {
                 true
             } else {
                 println!();
                 println!("  {} First run for this model", style.info("→"));
-                print!("  {} Would you like to tune for optimal performance? [Y/n]: ", style.info("→"));
+                print!(
+                    "  {} Would you like to tune for optimal performance? [Y/n]: ",
+                    style.info("→")
+                );
                 std::io::stdout().flush()?;
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
@@ -68,9 +128,10 @@ impl ServeCommand {
             };
 
             if run_tuning {
+                docker_client = Some(ensure_docker(style).await?);
                 println!("  {} Running tuning optimization...", style.info("→"));
                 std::io::stdout().flush()?;
-                
+
                 let extractor = GgufExtractor;
                 let facts = match extractor.extract(Path::new(&model_path)) {
                     Ok(f) => {
@@ -81,7 +142,11 @@ impl ServeCommand {
                         f
                     }
                     Err(e) => {
-                        println!("  {} Could not parse GGUF metadata: {}", style.warning("!"), e);
+                        println!(
+                            "  {} Could not parse GGUF metadata: {}",
+                            style.warning("!"),
+                            e
+                        );
                         println!("  {} Proceeding with default tuning", style.info("→"));
                         crate::tuning::GgufFacts {
                             path: Path::new(&model_path).to_path_buf(),
@@ -107,9 +172,9 @@ impl ServeCommand {
                         }
                     }
                 };
-                
+
                 let hardware_profile: HardwareProfile = hardware.clone().into();
-                
+
                 let opts = OptimizeOptions {
                     benchmark_ctx_size: Some(facts.context_length.unwrap_or(4096).min(4096)),
                     prompt_tokens: 512,
@@ -125,10 +190,11 @@ impl ServeCommand {
                     fine_budget_ms: 3000,
                     search_strategy: crate::tuning::SearchStrategy::Racing,
                 };
-                
-                let docker_image = Profile::select_docker_image(&hardware.gpu);
+
+                let backend = Backend::ACTIVE;
+                let docker_image = Profile::select_docker_image(&hardware.gpu, backend);
                 let model_path_for_tune = model_path.clone();
-                
+
                 let tune_result = crate::tuning::optimize_llama_cpp_profile(
                     &model_path,
                     hardware_profile,
@@ -138,24 +204,37 @@ impl ServeCommand {
                         let docker_image = docker_image.clone();
                         tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(async {
-                                run_benchmark(&model_path, &docker_image, llama_profile,
-                                    opts.warmup_samples, opts.benchmark_samples,
-                                    opts.prompt_tokens, opts.generation_tokens).await
+                                run_benchmark(
+                                    &model_path,
+                                    &docker_image,
+                                    llama_profile,
+                                    opts.warmup_samples,
+                                    opts.benchmark_samples,
+                                    opts.prompt_tokens,
+                                    opts.generation_tokens,
+                                )
+                                .await
                             })
                         })
                     },
                     opts,
-                ).map_err(|e| {
+                )
+                .map_err(|e| {
                     println!("  {} Tuning failed: {}", style.warning("!"), e);
-                    Error::Other { message: e.to_string() }
+                    Error::Other {
+                        message: e.to_string(),
+                    }
                 })?;
-                
-                let tuned_profile = convert_to_profile(&tune_result.profile, &model_path, &hardware);
+
+                let tuned_profile =
+                    convert_to_profile(&tune_result.profile, &model_path, &hardware);
                 let stats = tune_result.stats;
                 profile_manager.save(&tuned_profile).await?;
                 println!("{}  Tuning complete - profile saved", style.success("✓"));
-                println!("    Tested: {} candidates | Cache: {} entries", 
-                    stats.candidates_tested, stats.cache_size);
+                println!(
+                    "    Tested: {} candidates | Cache: {} entries",
+                    stats.candidates_tested, stats.cache_size
+                );
                 if let Some(best_result) = tune_result.profile.estimated_result.as_ref() {
                     println!("    Result: prompt_tps={:.1} | decode_tps={:.1} | latency={:.0}ms | stability={:.0}%",
                         best_result.prompt_tps,
@@ -165,28 +244,34 @@ impl ServeCommand {
                 }
                 tuned_profile
             } else {
-                let base = profile_manager.load_or_create(&model_path, &hardware).await?;
+                let base = profile_manager
+                    .load_or_create(&model_path, &hardware)
+                    .await?;
                 println!("  {} Using default configuration", style.info("→"));
                 base
             }
         } else if is_new_profile {
             println!("  {} Creating default profile", style.info("→"));
-            profile_manager.load_or_create(&model_path, &hardware).await?
+            profile_manager
+                .load_or_create(&model_path, &hardware)
+                .await?
         } else {
-            profile_manager.load_or_create(&model_path, &hardware).await?
+            profile_manager
+                .load_or_create(&model_path, &hardware)
+                .await?
         };
 
         self.apply_serve_overrides(&mut profile);
 
         if self.args.dry_run {
-            self.print_docker_command(&profile);
+            self.print_docker_command(&profile)?;
             return Ok(());
         }
 
-        println!("  {} Connecting to Docker...", style.info("→"));
-        std::io::stdout().flush()?;
-        let docker_client = DockerClient::new()?;
-        docker_client.get_info().await?;
+        let docker_client = match docker_client {
+            Some(client) => client,
+            None => ensure_docker(style).await?,
+        };
 
         println!("  {} Starting container...", style.info("→"));
         std::io::stdout().flush()?;
@@ -217,7 +302,7 @@ impl ServeCommand {
         println!(
             "  {} Stop with: {}",
             style.info("→"),
-            style.muted(format!("llmr stop"))
+            style.muted("llmr stop")
         );
 
         Ok(())
@@ -310,7 +395,10 @@ impl ServeCommand {
             scanner.scan_disks()
         };
 
-        let model_paths: Vec<String> = all.iter().map(|m| m.path.to_string_lossy().to_string()).collect();
+        let model_paths: Vec<String> = all
+            .iter()
+            .map(|m| m.path.to_string_lossy().to_string())
+            .collect();
         if !model_paths.is_empty() {
             let _ = profile_manager.save_model_cache(&model_paths).await;
         }
@@ -381,19 +469,20 @@ impl ServeCommand {
         Ok(Some(selected.path.to_string_lossy().to_string()))
     }
 
-    fn print_docker_command(&self, profile: &crate::models::Profile) {
+    fn print_docker_command(&self, profile: &crate::models::Profile) -> Result<()> {
         let style = &self.style;
         println!();
         println!("  {}", style.title("Docker Command"));
         println!();
         println!("docker run \\");
-        for arg in profile.to_docker_args(self.args.port, self.args.metrics, self.args.public) {
+        for arg in profile.to_docker_args(self.args.port, self.args.metrics, self.args.public)? {
             if arg.contains(' ') {
                 println!("  '{}' \\", arg);
             } else {
                 println!("  {} \\", arg);
             }
         }
+        Ok(())
     }
 
     async fn run_container(
@@ -421,7 +510,11 @@ impl ServeCommand {
             println!("  {} Image pulled", style.success("✓"));
         }
 
-        println!("  {} Starting llama.cpp server...", style.info("→"));
+        println!(
+            "  {} Starting {} server...",
+            style.info("→"),
+            profile.backend.display_name()
+        );
         std::io::stdout().flush()?;
         docker_client
             .run_container(
@@ -574,7 +667,10 @@ impl StatusCommand {
         };
 
         if containers.is_empty() {
-            println!("  {} No llama.cpp containers are running at the moment", style.dash());
+            println!(
+                "  {} No llmr containers are running at the moment",
+                style.dash()
+            );
             println!();
             println!("  {}", style.muted("Run `llmr serve` to start a container"));
             return Ok(());
@@ -874,7 +970,122 @@ pub struct VersionCommand;
 impl VersionCommand {
     pub async fn execute() -> Result<()> {
         println!("llmr {}", env!("CARGO_PKG_VERSION"));
-        println!("A tiny CLI for running optimised llama.cpp in Docker");
+        println!("Currently supports llama.cpp; vLLM and SGLang adapters are planned.");
+        Ok(())
+    }
+}
+
+pub struct UpdateCommand {
+    args: UpdateArgs,
+    #[allow(dead_code)]
+    style: Style,
+}
+
+impl UpdateCommand {
+    pub fn new(args: UpdateArgs, style: Style) -> Self {
+        Self { args, style }
+    }
+
+    pub async fn execute(&self) -> Result<()> {
+        let current = env!("CARGO_PKG_VERSION");
+
+        if self.args.check {
+            println!("{}", self.style.title("Checking for updates..."));
+            let latest = self.fetch_latest_version().await?;
+
+            if current == latest {
+                println!(
+                    "  {} Already on latest version {}",
+                    self.style.success("✓"),
+                    current
+                );
+                return Ok(());
+            }
+
+            println!(
+                "  {} Version {} available (you have {})",
+                self.style.info("→"),
+                latest,
+                current
+            );
+            println!();
+            println!("  Run {} to update", self.style.accent("llmr update"));
+            return Ok(());
+        }
+
+        println!("{}", self.style.title("Updating llmr..."));
+        println!("  Current: {}", current);
+
+        let latest = self.fetch_latest_version().await?;
+        println!("  Latest:  {}", latest);
+
+        if current == latest {
+            println!();
+            println!("  {} Already on latest version", self.style.success("✓"));
+            return Ok(());
+        }
+
+        println!();
+        self.perform_update().await
+    }
+
+    async fn fetch_latest_version(&self) -> Result<String> {
+        let url = "https://api.github.com/repos/aditya-xq/llmr/releases/latest";
+        let client = reqwest::Client::new();
+        let resp = client.get(url).send().await.map_err(|e| Error::Other {
+            message: format!("Failed to check for updates: {}", e),
+        })?;
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| Error::Other {
+            message: format!("Failed to parse response: {}", e),
+        })?;
+
+        let tag = json
+            .get("tag_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0.0.0")
+            .trim_start_matches('v');
+
+        Ok(tag.to_string())
+    }
+
+    async fn perform_update(&self) -> Result<()> {
+        let update_script = if cfg!(windows) {
+            "irm https://raw.githubusercontent.com/aditya-xq/llmr/main/install.ps1 | iex"
+        } else {
+            "curl -sSL https://raw.githubusercontent.com/aditya-xq/llmr/main/install.sh | sh"
+        };
+
+        println!("  {}", self.style.info("→") + " Running installer...");
+        println!();
+
+        let output = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(update_script)
+            .output()
+            .await
+            .map_err(|e| Error::Other {
+                message: format!("Failed to run update: {}", e),
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        print!("{}", stdout);
+        eprint!("{}", stderr);
+
+        if output.status.success() {
+            println!();
+            println!("  {} Update complete!", self.style.success("✓"))
+        } else {
+            println!();
+            println!(
+                "  {} Update may have failed. Try manually:",
+                self.style.warning("!")
+            );
+            println!("  {}", self.style.accent(update_script));
+        }
+
         Ok(())
     }
 }
@@ -891,9 +1102,14 @@ impl TuneCommand {
 
     pub async fn execute(&self) -> Result<()> {
         let style = &self.style;
+
+        let _ = ensure_docker(style).await?;
+
         let model_path = if let Some(model) = &self.args.model {
             if !Path::new(model).exists() {
-                return Err(Error::ModelNotFound { path: model.clone() });
+                return Err(Error::ModelNotFound {
+                    path: model.clone(),
+                });
             }
             model.clone()
         } else {
@@ -929,7 +1145,9 @@ impl TuneCommand {
         let extractor = GgufExtractor;
         let facts = extractor
             .extract(Path::new(&model_path))
-            .map_err(|e| Error::Other { message: format!("Failed to parse GGUF: {e}") })?;
+            .map_err(|e| Error::Other {
+                message: format!("Failed to parse GGUF: {e}"),
+            })?;
         println!("    Architecture: {}", facts.architecture);
         if let Some(ctx) = facts.context_length {
             println!("    Context Length: {}", ctx);
@@ -943,13 +1161,17 @@ impl TuneCommand {
         std::io::stdout().flush()?;
 
         let hardware_profile: crate::tuning::HardwareProfile = hardware.clone().into();
-        
+
         let opts = OptimizeOptions {
             benchmark_ctx_size: Some(facts.context_length.unwrap_or(4096).min(4096)),
             prompt_tokens: self.args.prompt_tokens.unwrap_or(512),
             generation_tokens: self.args.generation_tokens.unwrap_or(128),
             parallel_requests: 1,
-            max_rounds: if self.args.quick { 1 } else { self.args.max_rounds.unwrap_or(4) },
+            max_rounds: if self.args.quick {
+                1
+            } else {
+                self.args.max_rounds.unwrap_or(4)
+            },
             min_relative_gain: 0.01,
             warmup_samples: 2,
             benchmark_samples: 5,
@@ -961,41 +1183,59 @@ impl TuneCommand {
         };
 
         let model_path_for_bench = model_path.clone();
-        let docker_image = Profile::select_docker_image(&hardware.gpu);
-        
-let result = crate::tuning::optimize_llama_cpp_profile(
-                    &model_path,
-                    hardware_profile,
-                    &extractor,
-                    move |llama_profile| {
-                        let model_path = model_path_for_bench.clone();
-                        let docker_image = docker_image.clone();
-                        tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                run_benchmark(&model_path, &docker_image, llama_profile,
-                                    opts.warmup_samples, opts.benchmark_samples,
-                                    opts.prompt_tokens, opts.generation_tokens).await
-                            })
-                        })
-                    },
-                    opts,
-                ).map_err(|e| Error::Other { message: format!("Optimization failed: {e}") })?;
+        let backend = Backend::ACTIVE;
+        let docker_image = Profile::select_docker_image(&hardware.gpu, backend);
+
+        let result = crate::tuning::optimize_llama_cpp_profile(
+            &model_path,
+            hardware_profile,
+            &extractor,
+            move |llama_profile| {
+                let model_path = model_path_for_bench.clone();
+                let docker_image = docker_image.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        run_benchmark(
+                            &model_path,
+                            &docker_image,
+                            llama_profile,
+                            opts.warmup_samples,
+                            opts.benchmark_samples,
+                            opts.prompt_tokens,
+                            opts.generation_tokens,
+                        )
+                        .await
+                    })
+                })
+            },
+            opts,
+        )
+        .map_err(|e| Error::Other {
+            message: format!("Optimization failed: {e}"),
+        })?;
 
         let profile = &result.profile;
         let stats = result.stats;
-        
+
         println!();
         println!("  {} Best configuration found:", style.success("✓"));
-        println!("    Tested: {} candidates | Cache: {} entries", 
-            stats.candidates_tested, stats.cache_size);
-        println!("    Threads: {} | Batch: {} | UBatch: {}", profile.threads, profile.batch_size, profile.ubatch_size);
+        println!(
+            "    Tested: {} candidates | Cache: {} entries",
+            stats.candidates_tested, stats.cache_size
+        );
+        println!(
+            "    Threads: {} | Batch: {} | UBatch: {}",
+            profile.threads, profile.batch_size, profile.ubatch_size
+        );
         println!("    GPU Layers: {:?}", profile.n_gpu_layers);
         println!("    Split Mode: {:?}", profile.split_mode);
         println!("    Cache Type K: {:?}", profile.cache_type_k);
         println!("    Cache Type V: {:?}", profile.cache_type_v);
         if let Some(ref res) = profile.estimated_result {
-            println!("    Estimated: prompt={:.1}, decode={:.1} tok/s, latency={:.0}ms",
-                res.prompt_tps, res.decode_tps, res.latency_ms);
+            println!(
+                "    Estimated: prompt={:.1}, decode={:.1} tok/s, latency={:.0}ms",
+                res.prompt_tps, res.decode_tps, res.latency_ms
+            );
         }
         println!();
 
@@ -1009,7 +1249,7 @@ let result = crate::tuning::optimize_llama_cpp_profile(
             return Ok(());
         }
 
-        let profile = convert_to_profile(&profile, &model_path, &hardware);
+        let profile = convert_to_profile(profile, &model_path, &hardware);
 
         let profile_manager = ProfileManager::new();
         profile_manager.save(&profile).await?;
@@ -1155,7 +1395,7 @@ async fn run_benchmark(
         .args(&args)
         .output()
         .await
-        .map_err(|e| OptimizeError::Io(e))?;
+        .map_err(OptimizeError::Io)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1165,10 +1405,9 @@ async fn run_benchmark(
 
     let client = reqwest::Client::new();
     let start = std::time::Instant::now();
-    eprint!("    → Testing (t={},b={},ub={}) ... ",
-        llama_profile.threads,
-        llama_profile.batch_size,
-        llama_profile.ubatch_size
+    eprint!(
+        "    → Testing (t={},b={},ub={}) ... ",
+        llama_profile.threads, llama_profile.batch_size, llama_profile.ubatch_size
     );
     std::io::stdout().flush()?;
     let healthy = loop {
@@ -1182,7 +1421,14 @@ async fn run_benchmark(
                 let log_err = String::from_utf8_lossy(&logs.stderr);
                 if !log_err.is_empty() {
                     let lines: Vec<&str> = log_err.lines().collect();
-                    let last_30 = lines.iter().rev().take(30).rev().copied().collect::<Vec<_>>().join("\n");
+                    let last_30 = lines
+                        .iter()
+                        .rev()
+                        .take(30)
+                        .rev()
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     eprintln!("    Container stderr (last 30 lines):\n{}", last_30);
                 }
             }
@@ -1190,7 +1436,9 @@ async fn run_benchmark(
                 .args(["rm", "-f", &container_name])
                 .output()
                 .await;
-            return Err(OptimizeError::Benchmark("Timeout waiting for container".to_string()));
+            return Err(OptimizeError::Benchmark(
+                "Timeout waiting for container".to_string(),
+            ));
         }
 
         if let Ok(resp) = client
@@ -1203,7 +1451,7 @@ async fn run_benchmark(
                 break true;
             }
         }
-        if start.elapsed().as_secs() > 0 && start.elapsed().as_secs() % 15 == 0 {
+        if start.elapsed().as_secs() > 0 && start.elapsed().as_secs().is_multiple_of(15) {
             eprint!(".");
             let _ = std::io::stdout().flush();
         }
@@ -1215,20 +1463,29 @@ async fn run_benchmark(
             .args(["rm", "-f", &container_name])
             .output()
             .await;
-        return Err(OptimizeError::Benchmark("Container not healthy".to_string()));
+        return Err(OptimizeError::Benchmark(
+            "Container not healthy".to_string(),
+        ));
     }
 
     let prompt = "Write a detailed explanation of quantum computing, covering superposition, entanglement, and quantum gates. Be thorough and include examples.".chars().take(prompt_tokens as usize).collect::<String>();
     if prompt.len() < prompt_tokens as usize {
         let repeat = (prompt_tokens as usize / prompt.len()) + 1;
         let prompt = prompt.repeat(repeat);
-        let _prompt = prompt.chars().take(prompt_tokens as usize).collect::<String>();
+        let _prompt = prompt
+            .chars()
+            .take(prompt_tokens as usize)
+            .collect::<String>();
     }
 
     let prompt_for_request = prompt.clone();
     let gen_tokens = generation_tokens;
 
-    let run_single_request = async |client: &reqwest::Client, port: u16, prompt: &str, n_predict: u32| -> std::result::Result<(f32, f32, f32, u32), String> {
+    let run_single_request = async |client: &reqwest::Client,
+                                    port: u16,
+                                    prompt: &str,
+                                    n_predict: u32|
+           -> std::result::Result<(f32, f32, f32, u32), String> {
         let request_body = serde_json::json!({
             "prompt": prompt,
             "n_predict": n_predict,
@@ -1252,10 +1509,10 @@ async fn run_benchmark(
 
         let json: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
 
-let _tokens_predicted = json
-        .get("tokens_predicted")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(n_predict as u64) as f64;
+        let _tokens_predicted = json
+            .get("tokens_predicted")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(n_predict as u64) as f64;
 
         let tokens_evaluated = json
             .get("tokens_evaluated")
@@ -1341,9 +1598,13 @@ let _tokens_predicted = json
     let result = crate::tuning::BenchmarkResult::from_runs(runs)
         .ok_or_else(|| OptimizeError::Benchmark("All benchmark runs failed".to_string()))?;
 
-    println!(" ✓ prompt={:.1}, decode={:.1}, lat={:.0}ms, stable={:.1}%",
-        result.prompt_tps, result.decode_tps, result.latency_ms,
-        result.stability * 100.0);
+    println!(
+        " ✓ prompt={:.1}, decode={:.1}, lat={:.0}ms, stable={:.1}%",
+        result.prompt_tps,
+        result.decode_tps,
+        result.latency_ms,
+        result.stability * 100.0
+    );
 
     Ok(result)
 }
@@ -1357,13 +1618,447 @@ fn find_free_port(start: u16) -> u16 {
     start
 }
 
-fn convert_to_profile(llama_profile: &LlamaCppProfile, model_path: &str, hardware: &HardwareInfo) -> Profile {
-    let model_size = std::fs::metadata(model_path)
-        .map(|m| m.len())
+pub struct BenchCommand {
+    args: BenchArgs,
+    style: Style,
+}
+
+impl BenchCommand {
+    pub fn new(args: BenchArgs, style: Style) -> Self {
+        Self { args, style }
+    }
+
+    pub async fn execute(&self) -> Result<()> {
+        let style = &self.style;
+        let test_type = self
+            .args
+            .test_type
+            .clone()
+            .unwrap_or_else(|| "perf".to_string());
+
+        let config = if let Some(config_path) = &self.args.config {
+            let path = std::path::Path::new(config_path);
+            if !path.exists() {
+                return Err(Error::Other {
+                    message: format!("Config file not found: {}", config_path.display()),
+                });
+            }
+            match config::load_config(path) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    return Err(Error::Other {
+                        message: format!("Config error: {}", e),
+                    })
+                }
+            }
+        } else {
+            let default_config_path = std::path::Path::new("config.yaml");
+            if default_config_path.exists() {
+                match config::load_config(default_config_path) {
+                    Ok(cfg) => Some(cfg),
+                    Err(e) => {
+                        eprintln!("Warning: Failed to load config.yaml: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        let base_url = if let Some(ref cfg) = config {
+            let url = cfg.server.endpoint.as_str();
+            let url = url
+                .trim_end_matches("/v1/chat/completions")
+                .trim_end_matches("/v1")
+                .trim_end_matches("/chat/completions");
+            url
+        } else {
+            &self.args.base_url
+        };
+
+        println!();
+        println!("  {}", style.title("Benchmark"));
+        println!("  Test Type: {}", style.accent(&test_type));
+        println!("  Server: {}", style.accent(base_url));
+        if let Some(ref cfg) = config {
+            if !cfg.performance.prompts.is_empty() {
+                println!("  Prompts: {}", cfg.performance.prompts.len());
+            }
+            if cfg.quality.enabled && !cfg.quality.tasks.is_empty() {
+                println!("  Quality Tasks: {}", cfg.quality.tasks.join(", "));
+            }
+        }
+        println!();
+
+        match test_type.as_str() {
+            "quality" | "eval" | "lm-eval" => {
+                self.run_quality_eval(style, base_url, config.as_ref())
+                    .await?;
+            }
+            "perf" | "performance" | "speed" => {
+                self.run_performance_eval(style, base_url, config.as_ref())
+                    .await?;
+            }
+            _ => {
+                return Err(Error::Other {
+                    message: format!(
+                        "Unknown test type: {}. Use quality, perf, or eval",
+                        test_type
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_quality_eval(
+        &self,
+        style: &Style,
+        base_url: &str,
+        config: Option<&BenchmarkConfig>,
+    ) -> Result<()> {
+        use std::io::Write;
+        use tokio::process::Command as TokioCommand;
+
+        let tasks_str = if let Some(cfg) = config {
+            let tasks = if !cfg.quality.tasks.is_empty() {
+                cfg.quality.tasks.join(",")
+            } else {
+                self.args
+                    .tasks
+                    .clone()
+                    .unwrap_or_else(|| "gsm8k".to_string())
+            };
+            let fewshot = cfg.quality.num_fewshot.unwrap_or(self.args.fewshot);
+            (tasks, fewshot)
+        } else {
+            (
+                self.args
+                    .tasks
+                    .clone()
+                    .unwrap_or_else(|| "gsm8k".to_string()),
+                self.args.fewshot,
+            )
+        };
+        let tasks = &tasks_str.0;
+        let fewshot = tasks_str.1;
+
+        println!("  Tasks: {}", style.accent(tasks));
+        println!("  Few-shot: {}", fewshot);
+        println!();
+
+        let mut check = TokioCommand::new("python")
+            .args(["-c", "import lm_eval"])
+            .output()
+            .await;
+
+        if check.is_err() || !check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+            println!("  {} Installing lm-eval[api]...", style.info("→"));
+            let install = TokioCommand::new("pip")
+                .args(["install", "lm-eval[api]"])
+                .output()
+                .await
+                .map_err(|e| Error::Other {
+                    message: format!("Failed to install lm-eval: {}", e),
+                })?;
+
+            if !install.status.success() {
+                let stderr = String::from_utf8_lossy(&install.stderr);
+                return Err(Error::Other {
+                    message: format!("pip install failed: {}", stderr),
+                });
+            }
+
+            check = TokioCommand::new("python")
+                .args(["-c", "import lm_eval"])
+                .output()
+                .await;
+
+            if check.is_err() || !check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                println!("  {} Repairing broken installation...", style.info("→"));
+                let repair = TokioCommand::new("pip")
+                    .args(["install", "--force-reinstall", "--no-deps", "lm-eval"])
+                    .output()
+                    .await
+                    .map_err(|e| Error::Other {
+                        message: format!("Failed to repair lm-eval: {}", e),
+                    })?;
+
+                if !repair.status.success() {
+                    let stderr = String::from_utf8_lossy(&repair.stderr);
+                    return Err(Error::Other {
+                        message: format!("Repair failed: {}", stderr),
+                    });
+                }
+            }
+
+            println!("  {} lm-eval installed", style.success("✓"));
+        }
+
+        if self.args.dry_run {
+            println!("  {} Dry run - would run lm-eval", style.info("→"));
+            println!();
+            let cmd = format!(
+                "python -m lm_eval run --model local-chat-completions --model_args base_url={}/v1 --tasks {} --num_fewshot {}",
+                base_url, tasks, fewshot
+            );
+            println!("  Command: {}", style.muted(&cmd));
+            return Ok(());
+        }
+
+        println!("  {} Running quality evaluation...", style.info("→"));
+        std::io::stdout().flush()?;
+
+        let output = TokioCommand::new("python")
+            .args(["-m", "lm_eval", "run", "--model", "local-chat-completions"])
+            .args(["--model_args", &format!("base_url={}/v1", base_url)])
+            .args(["--tasks", tasks])
+            .args(["--num_fewshot", &fewshot.to_string()])
+            .output()
+            .await
+            .map_err(|e| Error::Other {
+                message: format!("Failed to run lm-eval: {}", e),
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() {
+            eprintln!("{}", stderr);
+            return Err(Error::Other {
+                message: "lm-eval failed".to_string(),
+            });
+        }
+
+        println!("{}", stdout);
+        if !stderr.is_empty() && !stderr.contains("INFO") {
+            eprintln!("{}", stderr);
+        }
+
+        println!();
+        println!("  {} Quality evaluation complete", style.success("✓"));
+        Ok(())
+    }
+
+    async fn run_performance_eval(
+        &self,
+        style: &Style,
+        base_url: &str,
+        config: Option<&BenchmarkConfig>,
+    ) -> Result<()> {
+        use std::time::Duration;
+
+        let (
+            prompt_tokens,
+            generation_tokens,
+            warmup,
+            samples,
+            prompts,
+            _max_tokens,
+            temperature,
+            top_p,
+            stream,
+        ) = if let Some(cfg) = config {
+            let perf = &cfg.performance;
+            let prompt_tokens = self.args.prompt_tokens.unwrap_or(512);
+            let generation_tokens = self.args.generation_tokens.unwrap_or(perf.max_tokens);
+            let warmup = if self.args.quick {
+                1
+            } else {
+                perf.warmup_runs.max(1)
+            };
+            let samples = if self.args.quick {
+                1
+            } else {
+                perf.measured_runs
+            };
+            let prompts = if !perf.prompts.is_empty() {
+                perf.prompts.clone()
+            } else {
+                vec!["Write a detailed explanation of quantum computing, covering superposition, entanglement, and quantum gates. Be thorough and include examples.".to_string()]
+            };
+            (
+                prompt_tokens,
+                generation_tokens,
+                warmup,
+                samples,
+                prompts,
+                perf.max_tokens,
+                perf.temperature,
+                perf.top_p,
+                perf.stream,
+            )
+        } else {
+            let prompt_tokens = self.args.prompt_tokens.unwrap_or(512);
+            let generation_tokens = self.args.generation_tokens.unwrap_or(128);
+            let warmup = if self.args.quick { 1 } else { 2 };
+            let samples = if self.args.quick { 1 } else { 3 };
+            (prompt_tokens, generation_tokens, warmup, samples, vec!["Write a detailed explanation of quantum computing, covering superposition, entanglement, and quantum gates. Be thorough and include examples.".to_string()], 256, 1.0, 1.0, false)
+        };
+
+        println!("  Prompts: {}", prompts.len());
+        println!("  Prompt tokens: {}", prompt_tokens);
+        println!("  Generation tokens: {}", generation_tokens);
+        println!("  Samples: {} (warmup: {})", samples, warmup);
+        println!();
+
+        if self.args.dry_run {
+            println!("  {} Dry run - would run performance test", style.info("→"));
+            return Ok(());
+        }
+
+        println!("  {} Running performance test...", style.info("→"));
+        std::io::stdout().flush()?;
+
+        let client = reqwest::Client::new();
+
+        let prompt_base = prompts.first().unwrap();
+        let prompt_base_len = prompt_base.chars().count() as u32;
+
+        let prompt: String = if prompt_base_len < prompt_tokens {
+            prompt_base
+                .repeat((prompt_tokens as usize / prompt_base_len as usize) + 1)
+                .chars()
+                .take(prompt_tokens as usize)
+                .collect()
+        } else {
+            prompt_base.chars().take(prompt_tokens as usize).collect()
+        };
+
+        let run_request = async |client: &reqwest::Client,
+                                 url: &str,
+                                 prompt: &str,
+                                 n_predict: u32|
+               -> std::result::Result<(f64, f64, f64), String> {
+            let req = serde_json::json!({
+                "prompt": prompt,
+                "n_predict": n_predict,
+                "temperature": temperature,
+                "top_p": top_p,
+                "stream": stream
+            });
+
+            let start = std::time::Instant::now();
+            let resp = client
+                .post(url)
+                .json(&req)
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await
+                .map_err(|e| format!("Request failed: {}", e))?;
+
+            let elapsed = start.elapsed().as_secs_f64();
+            let json: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("JSON parse failed: {}", e))?;
+
+            let tokens_predicted = json
+                .get("tokens_predicted")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as f64;
+            let tokens_evaluated = json
+                .get("tokens_evaluated")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as f64;
+            let predicted_ms = json
+                .get("timings")
+                .and_then(|t| t.get("predicted_ms"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let prompt_ms = json
+                .get("timings")
+                .and_then(|t| t.get("prompt_ms"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+
+            let prompt_tps = if prompt_ms > 0.0 {
+                tokens_evaluated / (prompt_ms / 1000.0)
+            } else {
+                0.0
+            };
+            let decode_tps = if predicted_ms > 0.0 {
+                tokens_predicted / (predicted_ms / 1000.0)
+            } else {
+                0.0
+            };
+            let latency_ms = elapsed * 1000.0;
+
+            Ok((prompt_tps, decode_tps, latency_ms))
+        };
+
+        let url = format!("{}/completion", base_url);
+
+        let mut results = Vec::new();
+
+        if warmup > 0 {
+            eprint!("    Warmup: ");
+            for _ in 0..warmup {
+                let _ = run_request(&client, &url, &prompt, 16).await;
+                eprint!(".");
+            }
+            eprintln!(" done");
+        }
+
+        eprint!("    Testing: ");
+        std::io::stdout().flush()?;
+
+        for _ in 0..samples {
+            match run_request(&client, &url, &prompt, generation_tokens).await {
+                Ok((prompt_tps, decode_tps, latency_ms)) => {
+                    results.push((prompt_tps, decode_tps, latency_ms));
+                    eprint!(".");
+                }
+                Err(e) => {
+                    eprintln!("\n    Error: {}", e);
+                }
+            }
+            std::io::stdout().flush()?;
+        }
+        eprintln!();
+
+        if results.is_empty() {
+            return Err(Error::Other {
+                message: "All tests failed".to_string(),
+            });
+        }
+
+        let n = results.len() as f64;
+        let avg_prompt: f64 = results.iter().map(|(p, _, _)| p).sum::<f64>() / n;
+        let avg_decode: f64 = results.iter().map(|(_, d, _)| d).sum::<f64>() / n;
+        let avg_latency: f64 = results.iter().map(|(_, _, l)| l).sum::<f64>() / n;
+
+        println!();
+        println!("  {} Results:", style.success("✓"));
+        println!("    Prompt processing: {:.1} tokens/sec", avg_prompt);
+        println!("    Token generation: {:.1} tokens/sec", avg_decode);
+        println!("    Latency: {:.0} ms", avg_latency);
+        println!(
+            "    Total throughput: {:.1} tokens/sec",
+            avg_prompt + avg_decode
+        );
+
+        Ok(())
+    }
+}
+
+fn convert_to_profile(
+    llama_profile: &LlamaCppProfile,
+    model_path: &str,
+    hardware: &HardwareInfo,
+) -> Profile {
+    let model_size = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+
+    let gpu_count = hardware
+        .gpu
+        .as_ref()
+        .map(|g| g.names.len() as u32)
         .unwrap_or(0);
-    
-    let gpu_count = hardware.gpu.as_ref().map(|g| g.names.len() as u32).unwrap_or(0);
-    let gpu_vram_total_mb = hardware.gpu.as_ref()
+    let gpu_vram_total_mb = hardware
+        .gpu
+        .as_ref()
         .map(|g| g.vram_mb.iter().sum())
         .unwrap_or(0);
 
@@ -1377,7 +2072,8 @@ fn convert_to_profile(llama_profile: &LlamaCppProfile, model_path: &str, hardwar
         crate::tuning::SplitMode::None => "none",
         crate::tuning::SplitMode::Layer => "layer",
         crate::tuning::SplitMode::Row => "row",
-    }.to_string();
+    }
+    .to_string();
 
     let cache_type_k = match llama_profile.cache_type_k {
         crate::tuning::KvCacheType::F32 => "f32",
@@ -1389,7 +2085,8 @@ fn convert_to_profile(llama_profile: &LlamaCppProfile, model_path: &str, hardwar
         crate::tuning::KvCacheType::IQ4_NL => "iq4_nl",
         crate::tuning::KvCacheType::Q5_0 => "q5_0",
         crate::tuning::KvCacheType::Q5_1 => "q5_1",
-    }.to_string();
+    }
+    .to_string();
 
     let cache_type_v = match llama_profile.cache_type_v {
         crate::tuning::KvCacheType::F32 => "f32",
@@ -1401,11 +2098,15 @@ fn convert_to_profile(llama_profile: &LlamaCppProfile, model_path: &str, hardwar
         crate::tuning::KvCacheType::IQ4_NL => "iq4_nl",
         crate::tuning::KvCacheType::Q5_0 => "q5_0",
         crate::tuning::KvCacheType::Q5_1 => "q5_1",
-    }.to_string();
+    }
+    .to_string();
 
-    let docker_image = Profile::select_docker_image(&hardware.gpu);
+    let backend = Backend::ACTIVE;
+    let docker_image = Profile::select_docker_image(&hardware.gpu, backend);
 
-    let gpu_type = hardware.gpu.as_ref()
+    let gpu_type = hardware
+        .gpu
+        .as_ref()
         .map(|g| g.type_.clone())
         .unwrap_or_else(|| "none".to_string());
 
@@ -1416,6 +2117,7 @@ fn convert_to_profile(llama_profile: &LlamaCppProfile, model_path: &str, hardwar
         gpu_count,
         gpu_vram_total_mb,
         docker_image,
+        backend,
         threads: llama_profile.threads as u32,
         batch_size: llama_profile.batch_size,
         ubatch_size: llama_profile.ubatch_size,
@@ -1428,6 +2130,9 @@ fn convert_to_profile(llama_profile: &LlamaCppProfile, model_path: &str, hardwar
         gpu_type,
         has_nvlink: hardware.has_nvlink,
         created_at: chrono::Utc::now().to_rfc3339(),
-        best_tps: llama_profile.estimated_result.clone().map(|r| (r.prompt_tps as f64 + r.decode_tps as f64) / 2.0),
+        best_tps: llama_profile
+            .estimated_result
+            .clone()
+            .map(|r| (r.prompt_tps as f64 + r.decode_tps as f64) / 2.0),
     }
 }

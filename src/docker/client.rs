@@ -15,11 +15,26 @@ const HEALTH_CHECK_TIMEOUT_SECS: u64 = 3;
 const HEALTH_CHECK_INTERVAL_SECS: u32 = 2;
 const HEALTH_CHECK_MAX_ATTEMPTS: u32 = 120;
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum DockerInstallStatus {
+    #[default]
+    NotInstalled,
+    Installed,
+    InstalledButNotRunning,
+}
+
+impl DockerInstallStatus {
+    pub fn is_installed(&self) -> bool {
+        !matches!(self, DockerInstallStatus::NotInstalled)
+    }
+}
+
 struct ContainerConfig<'a> {
     name: &'a str,
     image: &'a str,
     model_dir: &'a str,
     port: u16,
+    container_port: u16,
     profile: &'a Profile,
     enable_metrics: bool,
     public: bool,
@@ -35,6 +50,143 @@ impl DockerClient {
             return Err(Error::DockerCliNotFound);
         }
         Ok(Self)
+    }
+
+    pub fn check_installed() -> DockerInstallStatus {
+        if which::which("docker").is_ok() {
+            DockerInstallStatus::Installed
+        } else {
+            DockerInstallStatus::NotInstalled
+        }
+    }
+
+    pub async fn start_daemon() -> Result<()> {
+        Self::start_daemon_internal().await
+    }
+
+    async fn start_daemon_internal() -> Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            let desktop_path = std::env::var("ProgramFiles")
+                .map(|p| format!("{}\\Docker\\Docker\\Docker Desktop.exe", p))
+                .ok();
+
+            if let Some(path) = desktop_path {
+                if std::path::Path::new(&path).exists() {
+                    let output = tokio::process::Command::new(&path).spawn();
+
+                    if output.is_ok() {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let start_paths = [
+                "C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe",
+                "C:\\Program Files (x86)\\Docker\\Docker\\Docker Desktop.exe",
+            ];
+
+            for path in start_paths.iter() {
+                if std::path::Path::new(path).exists() {
+                    let output = tokio::process::Command::new(path).spawn();
+
+                    if output.is_ok() {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let output = tokio::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", "Start-Service docker"])
+                .output()
+                .await?;
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("NoServiceFoundForGivenName")
+                || stderr.contains("Cannot find any service")
+            {
+                return Err(Error::DockerError {
+                    message: "Docker Desktop is not running. Please start Docker Desktop from the Start menu or system tray.".to_string(),
+                });
+            }
+
+            Err(Error::DockerError {
+                message: format!("Failed to start Docker daemon: {}", stderr),
+            })
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let output = tokio::process::Command::new("open")
+                .args(["-a", "Docker"])
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(Error::DockerError {
+                    message: format!("Failed to start Docker: {}", stderr),
+                });
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let dockerd_check = tokio::process::Command::new("which")
+                .arg("dockerd")
+                .output()
+                .await?;
+
+            if dockerd_check.status.success() {
+                let output = tokio::process::Command::new("sudo")
+                    .args(["service", "docker", "start"])
+                    .output()
+                    .await?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let output2 = tokio::process::Command::new("dockerd")
+                        .arg("--version")
+                        .output()
+                        .await?;
+
+                    if !output2.status.success() {
+                        return Err(Error::DockerError {
+                            message: format!("Failed to start Docker daemon: {}", stderr),
+                        });
+                    }
+                }
+                return Ok(());
+            }
+
+            let output = tokio::process::Command::new("systemctl")
+                .args(["start", "docker"])
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(Error::DockerError {
+                    message: format!("Failed to start Docker daemon: {}", stderr),
+                });
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        {
+            Err(Error::DockerError {
+                message: "Unsupported platform for auto-starting Docker".to_string(),
+            })
+        }
     }
 
     pub async fn get_info(&self) -> Result<DockerInfo> {
@@ -107,12 +259,13 @@ impl DockerClient {
             .and_then(|p| p.to_str())
             .unwrap_or(".");
 
-        let is_gpu_image = Profile::is_gpu_image(image);
+        let is_gpu_image = profile.uses_gpu_image();
         let config = ContainerConfig {
             name,
             image,
             model_dir,
             port,
+            container_port: profile.container_port()?,
             profile,
             enable_metrics,
             public,
@@ -136,6 +289,7 @@ impl DockerClient {
                 image: &cpu_image,
                 model_dir,
                 port,
+                container_port: profile.container_port()?,
                 profile,
                 enable_metrics,
                 public,
@@ -168,9 +322,12 @@ impl DockerClient {
         cmd.args(["run", "--name", config.name, "-d"]);
 
         if config.public {
-            cmd.args(["-p", &format!("{}:8080", config.port)]);
+            cmd.args(["-p", &format!("{}:{}", config.port, config.container_port)]);
         } else {
-            cmd.args(["-p", &format!("127.0.0.1:{}:8080", config.port)]);
+            cmd.args([
+                "-p",
+                &format!("127.0.0.1:{}:{}", config.port, config.container_port),
+            ]);
         }
 
         if config.enable_gpu {
@@ -179,11 +336,11 @@ impl DockerClient {
 
         cmd.args(["-v", &format!("{}:/models:ro", config.model_dir)]);
         cmd.arg(config.image);
-        cmd.args(Self::server_args_for_mode(
-            config.profile,
-            config.enable_metrics,
-            config.enable_gpu,
-        ));
+        cmd.args(
+            config
+                .profile
+                .server_args_for_mode(config.enable_metrics, config.enable_gpu)?,
+        );
 
         if !config.debug {
             cmd.arg("--log-disable");
@@ -195,24 +352,6 @@ impl DockerClient {
             Duration::from_secs(DOCKER_RUN_TIMEOUT_SECS),
         )
         .await
-    }
-
-    fn server_args_for_mode(
-        profile: &Profile,
-        enable_metrics: bool,
-        enable_gpu: bool,
-    ) -> Vec<String> {
-        let mut server_args = profile.llama_server_args(enable_metrics);
-        if enable_gpu {
-            return server_args;
-        }
-
-        if let Some(pos) = server_args.iter().position(|arg| arg == "--n-gpu-layers") {
-            server_args.remove(pos);
-            server_args.remove(pos);
-        }
-        server_args.extend(["--n-gpu-layers".to_string(), "0".to_string()]);
-        server_args
     }
 
     fn cpu_fallback_image(image: &str) -> String {
@@ -458,9 +597,16 @@ impl DockerClient {
     }
 
     fn command_spawn_error(context: &str, err: std::io::Error) -> Error {
-        Error::DockerError {
-            message: format!("{}: {}", context, err),
-        }
+        let err_msg = err.to_string().to_lowercase();
+        let message = if err_msg.contains("no such file")
+            || err_msg.contains("cannot find")
+            || err_msg.contains("the system cannot find")
+        {
+            "Docker is not running. Ensure Docker Desktop is started.".to_string()
+        } else {
+            format!("{}: {}", context, err)
+        };
+        Error::DockerError { message }
     }
 
     fn command_output_error(context: &str, output: &Output) -> Error {
@@ -476,11 +622,32 @@ impl DockerClient {
 
     fn command_output_detail(output: &Output) -> String {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        let combined = if !stderr.is_empty() {
+            format!("{}\n{}", stderr, stdout)
+        } else {
+            stdout.clone()
+        };
+
+        let combined_lower = combined.to_lowercase();
+        if combined_lower.contains("cannot find")
+            || combined_lower.contains("no such file")
+            || combined_lower.contains("daemon not running")
+            || combined_lower.contains("docker daemon")
+            || combined_lower.contains("connection refused")
+            || combined_lower.contains("pipe")
+            || combined_lower.contains("//./pipe/docker")
+            || combined_lower.contains("failed to connect")
+        {
+            return "Docker is not running. Ensure Docker Desktop is started.".to_string();
+        }
+
         if !stderr.is_empty() {
             return stderr;
         }
 
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
+        stdout
     }
 
     fn parse_container_line(
@@ -557,18 +724,32 @@ pub struct DockerDiagnostic {
     pub daemon_running: bool,
     pub server_version: Option<String>,
     pub error: Option<String>,
+    pub install_status: DockerInstallStatus,
 }
 
 impl DockerClient {
     pub async fn diagnose() -> DockerDiagnostic {
+        let install_status = Self::check_installed();
+
+        if !install_status.is_installed() {
+            return DockerDiagnostic {
+                available: false,
+                daemon_running: false,
+                server_version: None,
+                error: Some("Docker not installed".to_string()),
+                install_status: DockerInstallStatus::NotInstalled,
+            };
+        }
+
         let client = match Self::new() {
             Ok(c) => c,
-            Err(e) => {
+            Err(_) => {
                 return DockerDiagnostic {
                     available: false,
                     daemon_running: false,
                     server_version: None,
-                    error: Some(e.to_string()),
+                    error: Some("Docker CLI not found".to_string()),
+                    install_status: DockerInstallStatus::Installed,
                 };
             }
         };
@@ -579,18 +760,21 @@ impl DockerClient {
                 daemon_running: true,
                 server_version: Some(info.server_version),
                 error: None,
+                install_status: DockerInstallStatus::Installed,
             },
-            Ok(Err(e)) => DockerDiagnostic {
+            Ok(Err(_)) => DockerDiagnostic {
                 available: true,
                 daemon_running: false,
                 server_version: None,
-                error: Some(e.to_string()),
+                error: Some("Daemon not running".to_string()),
+                install_status: DockerInstallStatus::Installed,
             },
             Err(_) => DockerDiagnostic {
                 available: true,
                 daemon_running: false,
                 server_version: None,
                 error: Some("Docker check timed out".to_string()),
+                install_status: DockerInstallStatus::Installed,
             },
         }
     }
@@ -604,13 +788,18 @@ impl DockerClient {
             if let Some(version) = &diag.server_version {
                 println!("      v{}", version);
             }
+        } else if diag.install_status == DockerInstallStatus::Installed {
+            println!("    {} Installed but not running", style.warning("!"));
+            if let Some(err) = &diag.error {
+                println!("      {}", style.muted(err));
+            }
         } else if diag.available {
             println!("    {} Failed to connect", style.warning("!"));
             if let Some(err) = &diag.error {
                 println!("      {}", style.muted(err));
             }
         } else {
-            println!("    {} Daemon not running", style.warning("!"));
+            println!("    {} Not installed", style.warning("!"));
             if let Some(err) = &diag.error {
                 println!("      {}", style.muted(err));
             }

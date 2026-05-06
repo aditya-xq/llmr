@@ -134,9 +134,7 @@ impl ModelScanner {
     #[cfg(target_os = "windows")]
     pub fn get_network_drives() -> Vec<PathBuf> {
         let mut drives = Vec::new();
-        let output = Command::new("netstat")
-            .args(["-n"])
-            .output();
+        let output = Command::new("netstat").args(["-n"]).output();
 
         if let Ok(out) = output {
             let text = String::from_utf8_lossy(&out.stdout);
@@ -303,7 +301,12 @@ impl ModelScanner {
         all_models
     }
 
-    fn scan_root(&self, root: &Path, models: &mut Vec<ModelInfo>, scanned: &mut std::collections::HashSet<PathBuf>) {
+    fn scan_root(
+        &self,
+        root: &Path,
+        models: &mut Vec<ModelInfo>,
+        scanned: &mut std::collections::HashSet<PathBuf>,
+    ) {
         let max_depth = 6;
         self.scan_recursive(root, models, 0, max_depth, scanned);
     }

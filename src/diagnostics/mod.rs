@@ -167,13 +167,13 @@ pub fn print_docker_diagnostic(style: &Style, diag: &DockerDiagnostic) {
         if let Some(version) = &diag.server_version {
             println!("      v{}", version);
         }
-    } else if diag.available {
-        println!("    {} Failed to connect", style.warning("!"));
+    } else if diag.install_status.is_installed() {
+        println!("    {} Installed but not running", style.warning("!"));
         if let Some(err) = &diag.error {
             println!("      {}", style.muted(err));
         }
     } else {
-        println!("    {} Daemon not running", style.warning("!"));
+        println!("    {} Not installed", style.warning("!"));
         if let Some(err) = &diag.error {
             println!("      {}", style.muted(err));
         }
@@ -240,13 +240,13 @@ mod tests {
     #[test]
     fn test_env_diagnostic_new() {
         let diag = EnvDiagnostic::new();
-        assert!(diag.config_dir.to_string_lossy().contains("llama.rs"));
+        assert!(diag.config_dir.to_string_lossy().contains("llmr"));
     }
 
     #[test]
     fn test_env_diagnostic_default() {
         let diag = EnvDiagnostic::default();
-        assert!(diag.config_dir.to_string_lossy().contains("llama.rs"));
+        assert!(diag.config_dir.to_string_lossy().contains("llmr"));
     }
 
     #[test]

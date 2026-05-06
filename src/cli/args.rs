@@ -2,16 +2,22 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(name = "llmr")]
-#[command(about = "A tiny CLI for running optimised inference via llama.cpp in Docker", long_about = None)]
+#[command(
+    about = "A tiny CLI for running optimised llama.cpp inference in Docker",
+    long_about = None
+)]
 pub struct Args {
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
     #[arg(short, long, global = true)]
     pub quiet: bool,
+
+    #[arg(long, global = true)]
+    pub version: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -21,8 +27,10 @@ pub enum Commands {
     Stop(StopArgs),
     Profiles(ProfilesArgs),
     Tune(TuneArgs),
+    Bench(BenchArgs),
     Doctor,
     Version,
+    Update(UpdateArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -161,4 +169,43 @@ pub struct TuneArgs {
 
     #[arg(long)]
     pub generation_tokens: Option<u32>,
+}
+
+#[derive(Parser, Debug)]
+pub struct BenchArgs {
+    #[arg(short = 'm', long)]
+    pub model: Option<String>,
+
+    #[arg(short = 'u', long, default_value = "http://127.0.0.1:8080")]
+    pub base_url: String,
+
+    #[arg(short = 't', long)]
+    pub test_type: Option<String>,
+
+    #[arg(short = 'c', long)]
+    pub config: Option<std::path::PathBuf>,
+
+    #[arg(long)]
+    pub tasks: Option<String>,
+
+    #[arg(long, default_value = "5")]
+    pub fewshot: u32,
+
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[arg(long)]
+    pub quick: bool,
+
+    #[arg(long)]
+    pub prompt_tokens: Option<u32>,
+
+    #[arg(long)]
+    pub generation_tokens: Option<u32>,
+}
+
+#[derive(Parser, Debug)]
+pub struct UpdateArgs {
+    #[arg(long)]
+    pub check: bool,
 }

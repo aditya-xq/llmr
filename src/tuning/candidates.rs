@@ -13,7 +13,9 @@ pub fn generate_all_candidates(
 
     candidates.extend(generate_gpu_offload_candidates(base, hardware));
     candidates.extend(generate_split_mode_candidates(base, hardware));
-    candidates.extend(generate_context_batch_candidates(base, facts, hardware, opts));
+    candidates.extend(generate_context_batch_candidates(
+        base, facts, hardware, opts,
+    ));
     candidates.extend(generate_thread_candidates(base, hardware));
     candidates.extend(generate_kv_cache_candidates(base, hardware));
     candidates.extend(generate_flash_attn_candidates(base, hardware));
@@ -88,7 +90,10 @@ impl Stage {
     }
 }
 
-pub fn generate_gpu_offload_candidates(base: &LlamaCppProfile, hardware: &HardwareProfile) -> Vec<LlamaCppProfile> {
+pub fn generate_gpu_offload_candidates(
+    base: &LlamaCppProfile,
+    hardware: &HardwareProfile,
+) -> Vec<LlamaCppProfile> {
     if hardware.gpus.is_empty() {
         return vec![];
     }
@@ -106,7 +111,7 @@ pub fn generate_gpu_offload_candidates(base: &LlamaCppProfile, hardware: &Hardwa
     });
 
     if max_layers > 0 {
-        for l in vec![1, 2, 4, 8, 16] {
+        for l in [1, 2, 4, 8, 16] {
             if l <= max_layers && l <= block_count {
                 let mut p = base.clone();
                 p.n_gpu_layers = GpuLayerSpec::Exact(l);
@@ -117,7 +122,7 @@ pub fn generate_gpu_offload_candidates(base: &LlamaCppProfile, hardware: &Hardwa
     }
 
     if max_layers > block_count / 2 {
-        for frac in vec![0.25, 0.5, 0.75, 1.0] {
+        for frac in [0.25, 0.5, 0.75, 1.0] {
             let layers = ((block_count as f32) * frac).ceil() as u32;
             if layers > 0 && layers <= max_layers {
                 let mut p = base.clone();
@@ -145,7 +150,10 @@ pub fn generate_gpu_offload_candidates(base: &LlamaCppProfile, hardware: &Hardwa
     candidates
 }
 
-pub fn generate_split_mode_candidates(base: &LlamaCppProfile, hardware: &HardwareProfile) -> Vec<LlamaCppProfile> {
+pub fn generate_split_mode_candidates(
+    base: &LlamaCppProfile,
+    hardware: &HardwareProfile,
+) -> Vec<LlamaCppProfile> {
     if hardware.gpus.len() < 2 {
         return vec![];
     }
@@ -193,9 +201,17 @@ pub fn generate_split_mode_candidates(base: &LlamaCppProfile, hardware: &Hardwar
     candidates
 }
 
-fn generate_context_batch_candidates(base: &LlamaCppProfile, facts: &GgufFacts, _hardware: &HardwareProfile, opts: &OptimizeOptions) -> Vec<LlamaCppProfile> {
+fn generate_context_batch_candidates(
+    base: &LlamaCppProfile,
+    facts: &GgufFacts,
+    _hardware: &HardwareProfile,
+    opts: &OptimizeOptions,
+) -> Vec<LlamaCppProfile> {
     let model_ctx = facts.context_length.unwrap_or(4096);
-    let ctx_size = opts.benchmark_ctx_size.unwrap_or(model_ctx).min(model_ctx.max(1));
+    let ctx_size = opts
+        .benchmark_ctx_size
+        .unwrap_or(model_ctx)
+        .min(model_ctx.max(1));
 
     let batch_sizes = multiplicative_ladder(base.batch_size, 32, 2048);
     let ubatch_sizes = multiplicative_ladder(base.ubatch_size.min(base.batch_size), 16, 512);
@@ -220,7 +236,10 @@ fn generate_context_batch_candidates(base: &LlamaCppProfile, facts: &GgufFacts, 
     candidates
 }
 
-fn generate_thread_candidates(base: &LlamaCppProfile, hardware: &HardwareProfile) -> Vec<LlamaCppProfile> {
+fn generate_thread_candidates(
+    base: &LlamaCppProfile,
+    hardware: &HardwareProfile,
+) -> Vec<LlamaCppProfile> {
     let phys = hardware.cpu_physical_cores.max(1);
     let logi = hardware.cpu_logical_cores.max(phys);
 
@@ -248,12 +267,7 @@ fn generate_thread_candidates(base: &LlamaCppProfile, hardware: &HardwareProfile
 
     for threads in thread_vals.iter().copied() {
         for threads_batch in thread_batch_vals.iter().copied() {
-            if threads_batch < threads && threads_batch > 0 {
-                let mut p = base.clone();
-                p.threads = threads;
-                p.threads_batch = threads_batch;
-                candidates.push(p);
-            } else if threads_batch >= threads {
+            if threads_batch > 0 {
                 let mut p = base.clone();
                 p.threads = threads;
                 p.threads_batch = threads_batch;
@@ -265,7 +279,10 @@ fn generate_thread_candidates(base: &LlamaCppProfile, hardware: &HardwareProfile
     candidates
 }
 
-pub fn generate_kv_cache_candidates(base: &LlamaCppProfile, hardware: &HardwareProfile) -> Vec<LlamaCppProfile> {
+pub fn generate_kv_cache_candidates(
+    base: &LlamaCppProfile,
+    hardware: &HardwareProfile,
+) -> Vec<LlamaCppProfile> {
     if hardware.gpus.is_empty() {
         return vec![];
     }
@@ -288,7 +305,10 @@ pub fn generate_kv_cache_candidates(base: &LlamaCppProfile, hardware: &HardwareP
         .collect()
 }
 
-fn generate_flash_attn_candidates(base: &LlamaCppProfile, hardware: &HardwareProfile) -> Vec<LlamaCppProfile> {
+fn generate_flash_attn_candidates(
+    base: &LlamaCppProfile,
+    hardware: &HardwareProfile,
+) -> Vec<LlamaCppProfile> {
     if hardware.gpus.is_empty() {
         return vec![];
     }
@@ -312,17 +332,24 @@ fn generate_flash_attn_candidates(base: &LlamaCppProfile, hardware: &HardwarePro
     ]
 }
 
-fn generate_memory_fit_candidates(base: &LlamaCppProfile, hardware: &HardwareProfile) -> Vec<LlamaCppProfile> {
+fn generate_memory_fit_candidates(
+    base: &LlamaCppProfile,
+    hardware: &HardwareProfile,
+) -> Vec<LlamaCppProfile> {
     if hardware.gpus.is_empty() {
         return vec![];
     }
 
-    let targets = hardware.gpus.iter().map(|g| ((g.vram_bytes / 1024 / 1024) as u32 / 16).clamp(256, 2048)).collect::<Vec<_>>();
+    let targets = hardware
+        .gpus
+        .iter()
+        .map(|g| ((g.vram_bytes / 1024 / 1024) as u32 / 16).clamp(256, 2048))
+        .collect::<Vec<_>>();
 
     let mut candidates = vec![];
 
     for fit in [true, false] {
-        for fit_target in vec![targets.clone(), vec![512], vec![1024], vec![2048]] {
+        for fit_target in [targets.clone(), vec![512], vec![1024], vec![2048]] {
             let mut p = base.clone();
             p.fit = fit;
             p.fit_target_mib = fit_target;
@@ -330,7 +357,7 @@ fn generate_memory_fit_candidates(base: &LlamaCppProfile, hardware: &HardwarePro
         }
     }
 
-    for (mmap, mlock) in vec![(true, true), (true, false), (false, true), (false, false)] {
+    for (mmap, mlock) in [(true, true), (true, false), (false, true), (false, false)] {
         let mut p = base.clone();
         p.mmap = mmap;
         p.mlock = mlock;
@@ -346,7 +373,10 @@ fn generate_memory_fit_candidates(base: &LlamaCppProfile, hardware: &HardwarePro
     candidates
 }
 
-pub fn generate_cpu_affinity_candidates(base: &LlamaCppProfile, hardware: &HardwareProfile) -> Vec<LlamaCppProfile> {
+pub fn generate_cpu_affinity_candidates(
+    base: &LlamaCppProfile,
+    hardware: &HardwareProfile,
+) -> Vec<LlamaCppProfile> {
     if !hardware.gpus.is_empty() {
         return vec![];
     }
@@ -391,13 +421,13 @@ pub fn generate_cpu_affinity_candidates(base: &LlamaCppProfile, hardware: &Hardw
         }
     }
 
-    for poll in vec![None, Some(0), Some(32), Some(64)] {
+    for poll in [None, Some(0), Some(32), Some(64)] {
         let mut p = base.clone();
         p.poll = poll;
         candidates.push(p);
     }
 
-    for poll_batch in vec![None, Some(0), Some(32)] {
+    for poll_batch in [None, Some(0), Some(32)] {
         let mut p = base.clone();
         p.poll_batch = poll_batch;
         candidates.push(p);
@@ -406,14 +436,18 @@ pub fn generate_cpu_affinity_candidates(base: &LlamaCppProfile, hardware: &Hardw
     candidates
 }
 
-fn generate_spec_candidates(base: &LlamaCppProfile, hardware: &HardwareProfile, opts: &OptimizeOptions) -> Vec<LlamaCppProfile> {
+fn generate_spec_candidates(
+    base: &LlamaCppProfile,
+    hardware: &HardwareProfile,
+    opts: &OptimizeOptions,
+) -> Vec<LlamaCppProfile> {
     if hardware.gpus.is_empty() || opts.generation_tokens <= 32 {
         return vec![];
     }
 
     let mut candidates = vec![];
 
-    for n in vec![2, 3, 4, 5, 6] {
+    for n in [2, 3, 4, 5, 6] {
         let mut p = base.clone();
         p.spec_type = Some(SpecType::NGram);
         p.spec_extra = Some(format!("n={}", n));
@@ -451,10 +485,12 @@ fn multiplicative_ladder(current: u32, min_val: u32, max_val: u32) -> Vec<u32> {
         .filter(|v| *v >= min_val && *v <= max_val)
         .collect::<Vec<_>>();
 
-    let mut all: Vec<u32> = seed_neighbors.into_iter().chain(default_region.into_iter()).collect();
+    let mut all: Vec<u32> = seed_neighbors.into_iter().chain(default_region).collect();
     all.sort();
     all.dedup();
-    all.into_iter().filter(|v| *v >= min_val && *v <= max_val).collect()
+    all.into_iter()
+        .filter(|v| *v >= min_val && *v <= max_val)
+        .collect()
 }
 
 fn normalized_vram_split(gpus: &[crate::tuning::GpuProfile]) -> Vec<f32> {
@@ -462,11 +498,13 @@ fn normalized_vram_split(gpus: &[crate::tuning::GpuProfile]) -> Vec<f32> {
     if total <= 0.0 {
         return vec![1.0 / gpus.len().max(1) as f32; gpus.len()];
     }
-    gpus.iter().map(|g| (g.vram_bytes as f64 / total) as f32).collect()
+    gpus.iter()
+        .map(|g| (g.vram_bytes as f64 / total) as f32)
+        .collect()
 }
 
 fn dedupe_profiles(mut profiles: Vec<LlamaCppProfile>) -> Vec<LlamaCppProfile> {
-    profiles.sort_by(|a, b| a.fingerprint().cmp(&b.fingerprint()));
+    profiles.sort_by_key(|a| a.fingerprint());
     profiles.dedup_by(|a, b| a.fingerprint() == b.fingerprint());
     profiles
 }

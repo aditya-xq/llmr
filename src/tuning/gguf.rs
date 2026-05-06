@@ -35,7 +35,10 @@ pub fn extract_from_reader<R: Read + ?Sized>(
     };
 
     if version < 3 {
-        return Err(OptimizeError::Parse(format!("Unsupported GGUF version: {}", version)));
+        return Err(OptimizeError::Parse(format!(
+            "Unsupported GGUF version: {}",
+            version
+        )));
     }
 
     let tensor_count = read_u64(reader)?;
@@ -149,7 +152,10 @@ pub fn extract_from_reader<R: Read + ?Sized>(
             "llama.rope.scaling.freq_base" => {
                 skip_value(reader, value_type)?;
             }
-            "llama.rope.scale" | "llama.rope.scale.linear" | "llama.rope.scale Yarn" | "llama.rope.scaling.original_context" => {
+            "llama.rope.scale"
+            | "llama.rope.scale.linear"
+            | "llama.rope.scale Yarn"
+            | "llama.rope.scaling.original_context" => {
                 skip_value(reader, value_type)?;
             }
             "tokenizer.chat_template" => {
@@ -219,15 +225,33 @@ pub fn read_string<R: Read + ?Sized>(reader: &mut R) -> Result<String, OptimizeE
 
 pub fn skip_value<R: Read + ?Sized>(reader: &mut R, value_type: u8) -> Result<(), OptimizeError> {
     match value_type {
-        0 => { read_u8(reader)?; }
-        1 => { read_u8(reader)?; }
-        2 => { read_u16(reader)?; }
-        3 => { read_u16(reader)?; }
-        4 => { read_u32(reader)?; }
-        5 => { read_u32(reader)?; }
-        6 => { read_f32(reader)?; }
-        7 => { read_u8(reader)?; }
-        8 => { let _ = read_string(reader)?; }
+        0 => {
+            read_u8(reader)?;
+        }
+        1 => {
+            read_u8(reader)?;
+        }
+        2 => {
+            read_u16(reader)?;
+        }
+        3 => {
+            read_u16(reader)?;
+        }
+        4 => {
+            read_u32(reader)?;
+        }
+        5 => {
+            read_u32(reader)?;
+        }
+        6 => {
+            read_f32(reader)?;
+        }
+        7 => {
+            read_u8(reader)?;
+        }
+        8 => {
+            let _ = read_string(reader)?;
+        }
         9 => {
             let elem_type = read_u32(reader)? as u8;
             let len = read_u64(reader)?;
@@ -235,10 +259,18 @@ pub fn skip_value<R: Read + ?Sized>(reader: &mut R, value_type: u8) -> Result<()
                 skip_value(reader, elem_type)?;
             }
         }
-        10 => { read_u64(reader)?; }
-        11 => { read_u64(reader)?; }
-        12 => { read_f64(reader)?; }
-        _ => { skip_value(reader, 0)?; }
+        10 => {
+            read_u64(reader)?;
+        }
+        11 => {
+            read_u64(reader)?;
+        }
+        12 => {
+            read_f64(reader)?;
+        }
+        _ => {
+            skip_value(reader, 0)?;
+        }
     }
     Ok(())
 }

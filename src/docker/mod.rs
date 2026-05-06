@@ -1,3 +1,3 @@
 pub mod client;
 
-pub use client::{ContainerInfo, DockerClient, DockerDiagnostic, DockerInfo};
+pub use client::{ContainerInfo, DockerClient, DockerDiagnostic, DockerInfo, DockerInstallStatus};
