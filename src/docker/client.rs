@@ -3,7 +3,7 @@ use crate::models::Profile;
 use crate::utils::Style;
 use std::process::Output;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 use tracing::info;
 use tracing::warn;
 
@@ -11,9 +11,11 @@ const DOCKER_FORMAT: &str = "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}";
 const DOCKER_COMMAND_TIMEOUT_SECS: u64 = 30;
 const DOCKER_PULL_TIMEOUT_SECS: u64 = 600;
 const DOCKER_RUN_TIMEOUT_SECS: u64 = 60;
-const HEALTH_CHECK_TIMEOUT_SECS: u64 = 3;
-const HEALTH_CHECK_INTERVAL_SECS: u32 = 2;
-const HEALTH_CHECK_MAX_ATTEMPTS: u32 = 120;
+const HEALTH_CHECK_TIMEOUT_MS: u64 = 750;
+const HEALTH_CHECK_FAST_INTERVAL_MS: u64 = 250;
+const HEALTH_CHECK_SLOW_INTERVAL_MS: u64 = 1_000;
+const HEALTH_CHECK_FAST_WINDOW_SECS: u64 = 10;
+const HEALTH_CHECK_MAX_WAIT_SECS: u64 = 240;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum DockerInstallStatus {
@@ -408,6 +410,19 @@ impl DockerClient {
         Ok(None)
     }
 
+    pub async fn container_exists(&self, name: &str) -> Result<bool> {
+        let filter = format!("name=^/{}$", name);
+        let output = Self::run_docker_command(
+            ["ps", "-a", "--filter", &filter, "--format", "{{.Names}}"],
+            &format!("Failed to inspect container '{}'", name),
+        )
+        .await?;
+
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|container_name| container_name.trim() == name))
+    }
+
     async fn get_container_ports(&self, name: &str) -> Result<Vec<(u16, String)>> {
         let output = Self::run_docker_command(
             ["port", name],
@@ -514,38 +529,52 @@ impl DockerClient {
     pub async fn wait_for_health(&self, name: &str, port: u16) -> Result<()> {
         info!("Waiting for container '{}' to be healthy", name);
 
-        for attempt in 1..=HEALTH_CHECK_MAX_ATTEMPTS {
-            if self.is_port_accessible(port).await {
+        let client = reqwest::Client::new();
+        let started = Instant::now();
+        let max_wait = Duration::from_secs(HEALTH_CHECK_MAX_WAIT_SECS);
+        let mut last_log_second = 0;
+
+        loop {
+            if self.is_port_accessible(&client, port).await {
                 info!("Container '{}' is healthy", name);
                 return Ok(());
             }
 
-            if attempt % 10 == 0 {
+            let elapsed = started.elapsed();
+            if elapsed >= max_wait {
+                break;
+            }
+
+            let elapsed_secs = elapsed.as_secs();
+            if elapsed_secs >= last_log_second + 10 {
+                last_log_second = elapsed_secs;
                 info!(
                     "  Waiting... {}/{}s",
-                    attempt * HEALTH_CHECK_INTERVAL_SECS,
-                    HEALTH_CHECK_MAX_ATTEMPTS * HEALTH_CHECK_INTERVAL_SECS
+                    elapsed_secs, HEALTH_CHECK_MAX_WAIT_SECS
                 );
             }
 
-            tokio::time::sleep(Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS as u64)).await;
+            let interval = if elapsed_secs < HEALTH_CHECK_FAST_WINDOW_SECS {
+                Duration::from_millis(HEALTH_CHECK_FAST_INTERVAL_MS)
+            } else {
+                Duration::from_millis(HEALTH_CHECK_SLOW_INTERVAL_MS)
+            };
+            tokio::time::sleep(interval).await;
         }
 
         Err(Error::Timeout {
             message: format!(
                 "Container '{}' did not become healthy within {} seconds",
-                name,
-                HEALTH_CHECK_MAX_ATTEMPTS * HEALTH_CHECK_INTERVAL_SECS
+                name, HEALTH_CHECK_MAX_WAIT_SECS
             ),
         })
     }
 
-    async fn is_port_accessible(&self, port: u16) -> bool {
-        let client = reqwest::Client::new();
+    async fn is_port_accessible(&self, client: &reqwest::Client, port: u16) -> bool {
         let url = format!("http://localhost:{}/health", port);
         match client
             .get(&url)
-            .timeout(Duration::from_secs(HEALTH_CHECK_TIMEOUT_SECS))
+            .timeout(Duration::from_millis(HEALTH_CHECK_TIMEOUT_MS))
             .send()
             .await
         {

@@ -108,11 +108,38 @@ impl BenchmarkReport {
 
         if let Some(ref perf) = self.performance {
             output.push_str("\n=== Performance ===\n");
-            output.push_str(&format!("Latency avg: {:.2} ms\n", perf.latency_avg));
-            output.push_str(&format!("Latency p50: {:.2} ms\n", perf.latency_p50));
-            output.push_str(&format!("TTFT avg: {:.2} ms\n", perf.ttft_avg));
-            output.push_str(&format!("Tokens/sec avg: {:.2}\n", perf.tokens_per_sec_avg));
-            output.push_str(&format!("Error rate: {:.2}%\n", perf.error_rate * 100.0));
+            output.push_str(&format!(
+                "  Runs: {}/{} successful\n",
+                perf.successful_runs, perf.total_runs
+            ));
+            output.push_str(&format!("  Error rate: {:.2}%\n", perf.error_rate * 100.0));
+            output.push_str("\n  Latency:\n");
+            output.push_str(&format!("    Mean: {:.2} ms\n", perf.latency_avg));
+            output.push_str(&format!("    Min:  {:.2} ms\n", perf.latency_min));
+            output.push_str(&format!("    Max:  {:.2} ms\n", perf.latency_max));
+            output.push_str(&format!("    p50:  {:.2} ms\n", perf.latency_p50));
+            output.push_str(&format!("    p90:  {:.2} ms\n", perf.latency_p90));
+            output.push_str(&format!("    p95:  {:.2} ms\n", perf.latency_p95));
+            output.push_str(&format!("    p99:  {:.2} ms\n", perf.latency_p99));
+            output.push_str(&format!("    StdDev: {:.2} ms\n", perf.latency_stddev));
+            output.push_str(&format!("    CV: {:.2}%\n", perf.latency_cv));
+            output.push_str("\n  First Token (TTFT):\n");
+            output.push_str(&format!("    Mean: {:.2} ms\n", perf.ttft_avg));
+            output.push_str(&format!("    Min:  {:.2} ms\n", perf.ttft_min));
+            output.push_str(&format!("    Max:  {:.2} ms\n", perf.ttft_max));
+            output.push_str("\n  Throughput:\n");
+            output.push_str(&format!(
+                "    Mean: {:.2} tokens/sec\n",
+                perf.tokens_per_sec_avg
+            ));
+            output.push_str(&format!(
+                "    Min:  {:.2} tokens/sec\n",
+                perf.tokens_per_sec_min
+            ));
+            output.push_str(&format!(
+                "    Max:  {:.2} tokens/sec\n",
+                perf.tokens_per_sec_max
+            ));
         }
 
         if let Some(ref quality) = self.quality {

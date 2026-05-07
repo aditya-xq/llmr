@@ -202,6 +202,12 @@ pub struct BenchArgs {
 
     #[arg(long)]
     pub generation_tokens: Option<u32>,
+
+    #[arg(long)]
+    pub parallel: Option<usize>,
+
+    #[arg(long)]
+    pub retries: Option<u32>,
 }
 
 #[derive(Parser, Debug)]

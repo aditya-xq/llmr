@@ -192,3 +192,8 @@ src/
 - **Situation**: Adding or referencing inference backends beyond llama.cpp
 - **Lesson**: Keep planned backends in typed metadata, but reject serve/tune execution until their Docker args, health checks, and tuning profiles are implemented
 - **Example**: vLLM and SGLang can appear as planned `Backend` variants, but `Profile::server_args` must not silently reuse llama.cpp flags for them
+
+## Patterns: Startup Readiness Should Poll Fast First
+- **Situation**: Waiting for a local server or container to become ready after startup
+- **Lesson**: Start with short health-check intervals and bounded request timeouts, then back off to slower polling; avoid coarse fixed sleeps that add avoidable latency after the service is already ready
+- **Example**: For `serve`, poll `/health` immediately and every few hundred milliseconds during the initial startup window instead of waiting two seconds between attempts
