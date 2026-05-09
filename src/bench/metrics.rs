@@ -52,10 +52,23 @@ impl Default for BenchmarkMetrics {
 #[derive(Debug, Clone, Serialize)]
 pub struct PerformanceSummary {
     pub latency_avg: f64,
+    pub latency_min: f64,
+    pub latency_max: f64,
     pub latency_p50: f64,
+    pub latency_p90: f64,
+    pub latency_p95: f64,
+    pub latency_p99: f64,
+    pub latency_stddev: f64,
+    pub latency_cv: f64,
     pub ttft_avg: f64,
+    pub ttft_min: f64,
+    pub ttft_max: f64,
     pub tokens_per_sec_avg: f64,
+    pub tokens_per_sec_min: f64,
+    pub tokens_per_sec_max: f64,
     pub error_rate: f64,
+    pub successful_runs: usize,
+    pub total_runs: usize,
 }
 
 pub struct MetricsAggregator {
@@ -99,11 +112,54 @@ impl MetricsAggregator {
         };
 
         let latency_p50 = calculate_percentile(&measured, |r| r.latency_ms as f64, 50);
+        let latency_p90 = calculate_percentile(&measured, |r| r.latency_ms as f64, 90);
+        let latency_p95 = calculate_percentile(&measured, |r| r.latency_ms as f64, 95);
+        let latency_p99 = calculate_percentile(&measured, |r| r.latency_ms as f64, 99);
+
+        let (latency_min, latency_max) = if !measured.is_empty() {
+            let latencies: Vec<f64> = measured.iter().map(|r| r.latency_ms as f64).collect();
+            (
+                latencies.iter().cloned().fold(f64::INFINITY, f64::min),
+                latencies.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+        let latency_stddev = if successful > 1 {
+            let variance = measured
+                .iter()
+                .map(|r| {
+                    let diff = r.latency_ms as f64 - latency_avg;
+                    diff * diff
+                })
+                .sum::<f64>()
+                / (successful - 1) as f64;
+            variance.sqrt()
+        } else {
+            0.0
+        };
+
+        let latency_cv = if latency_avg > 0.0 {
+            (latency_stddev / latency_avg) * 100.0
+        } else {
+            0.0
+        };
 
         let ttft_avg = if successful > 0 {
             measured.iter().map(|r| r.ttft_ms as f64).sum::<f64>() / successful as f64
         } else {
             0.0
+        };
+
+        let (ttft_min, ttft_max) = if !measured.is_empty() {
+            let ttfts: Vec<f64> = measured.iter().map(|r| r.ttft_ms as f64).collect();
+            (
+                ttfts.iter().cloned().fold(f64::INFINITY, f64::min),
+                ttfts.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            )
+        } else {
+            (0.0, 0.0)
         };
 
         let tokens_per_sec_avg = if successful > 0 {
@@ -112,12 +168,35 @@ impl MetricsAggregator {
             0.0
         };
 
+        let (tokens_per_sec_min, tokens_per_sec_max) = if !measured.is_empty() {
+            let tps: Vec<f64> = measured.iter().map(|r| r.tokens_per_sec).collect();
+            (
+                tps.iter().cloned().fold(f64::INFINITY, f64::min),
+                tps.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
         PerformanceSummary {
             latency_avg,
+            latency_min,
+            latency_max,
             latency_p50,
+            latency_p90,
+            latency_p95,
+            latency_p99,
+            latency_stddev,
+            latency_cv,
             ttft_avg,
+            ttft_min,
+            ttft_max,
             tokens_per_sec_avg,
+            tokens_per_sec_min,
+            tokens_per_sec_max,
             error_rate,
+            successful_runs: successful,
+            total_runs,
         }
     }
 }

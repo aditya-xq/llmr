@@ -68,6 +68,15 @@ async fn test_docker_get_container_nonexistent() {
 }
 
 #[tokio::test]
+async fn test_docker_container_exists_nonexistent() {
+    let Ok(client) = DockerClient::new() else {
+        return;
+    };
+    let exists = client.container_exists("nonexistent-container-12345").await;
+    assert!(matches!(exists, Ok(false) | Err(Error::DockerError { .. })));
+}
+
+#[tokio::test]
 async fn test_docker_list_containers() {
     let Ok(client) = DockerClient::new() else {
         return;

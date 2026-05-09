@@ -1,0 +1,104 @@
+name: Release on Merge
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-on-merge
+  cancel-in-progress: false
+
+jobs:
+  tag-release:
+    name: Bump Version and Tag
+    if: |
+      !contains(github.event.head_commit.message, '[skip release]') &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Determine release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          last_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -n "$last_tag" ]; then
+            commits="$(git log --format=%s "${last_tag}..HEAD")"
+          else
+            commits="$(git log --format=%s)"
+          fi
+
+          if ! printf '%s\n' "$commits" | grep -qviE '^(chore|docs|ci|workflow)(\(.+\))?:|^\[skip release\]'; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          bump="patch"
+          if printf '%s\n' "$commits" | grep -qiE 'BREAKING CHANGE|!:'; then
+            bump="major"
+          elif printf '%s\n' "$commits" | grep -qiE '^feat(\(.+\))?:'; then
+            bump="minor"
+          fi
+
+          current="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "llmr") | .version')"
+          IFS=. read -r major minor patch <<< "$current"
+
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+
+          next="${major}.${minor}.${patch}"
+          tag="v${next}"
+
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Update Cargo version
+        if: steps.version.outputs.release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          python -c "import pathlib,re; p=pathlib.Path('Cargo.toml'); s=p.read_text(); p.write_text(re.sub(r'^version = \".*\"', 'version = \"${version}\"', s, count=1, flags=re.M))"
+          cargo check
+          cargo check --locked
+
+      - name: Commit and tag
+        if: steps.version.outputs.release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip release]"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Start release workflow
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release.yml --ref main -f tag=${{ steps.version.outputs.tag }}

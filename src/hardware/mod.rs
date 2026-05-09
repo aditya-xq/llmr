@@ -368,24 +368,22 @@ fn detect_intel_gpu_linux() -> Option<Vec<GpuDevice>> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for section in stdout.split("\n\n") {
-        if section.contains("Class: VGA compatible controller")
-            || section.contains("Class: 3D controller")
+        if (section.contains("Class: VGA compatible controller")
+            || section.contains("Class: 3D controller"))
+            && section.contains("0x8086")
         {
-            if section.contains("0x8086") {
-                // Found Intel GPU, try to get its name
-                let name = section
-                    .lines()
-                    .find(|line| line.starts_with("Device:"))
-                    .and_then(|line| line.strip_prefix("Device:").map(|s| s.trim().to_string()))
-                    .unwrap_or_else(|| "Intel Graphics".to_string());
+            let name = section
+                .lines()
+                .find(|line| line.starts_with("Device:"))
+                .and_then(|line| line.strip_prefix("Device:").map(|s| s.trim().to_string()))
+                .unwrap_or_else(|| "Intel Graphics".to_string());
 
-                return Some(vec![GpuDevice {
-                    name,
-                    vram_mb: 0,
-                    vram_free_mb: 0,
-                    memory_type: GpuMemoryType::Shared,
-                }]);
-            }
+            return Some(vec![GpuDevice {
+                name,
+                vram_mb: 0,
+                vram_free_mb: 0,
+                memory_type: GpuMemoryType::Shared,
+            }]);
         }
     }
 
@@ -507,6 +505,7 @@ async fn detect_nvlink() -> bool {
             tokio::process::Command::new("nvidia-smi")
                 .args(["nvlink", "--status"])
                 .output()
+                .await
                 .ok()
                 .map(|output| {
                     let stderr = String::from_utf8_lossy(&output.stderr);

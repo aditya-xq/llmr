@@ -494,12 +494,17 @@ impl ServeCommand {
         let container_name = profile.container_name();
         let style = &self.style;
 
-        if let Some(_existing) = docker_client.get_container(&container_name).await? {
+        let (container_exists, image_exists) = tokio::join!(
+            docker_client.container_exists(&container_name),
+            docker_client.image_exists(&profile.docker_image)
+        );
+
+        if container_exists? {
             println!("  {} Removing existing container", style.info("→"));
             docker_client.remove_container(&container_name).await?;
         }
 
-        if !docker_client.image_exists(&profile.docker_image).await {
+        if !image_exists {
             println!(
                 "  {} Pulling Docker image ({})...",
                 style.info("→"),
@@ -1595,16 +1600,52 @@ async fn run_benchmark(
         .output()
         .await;
 
-    let result = crate::tuning::BenchmarkResult::from_runs(runs)
+    let result = crate::tuning::BenchmarkResult::from_runs(runs.clone())
         .ok_or_else(|| OptimizeError::Benchmark("All benchmark runs failed".to_string()))?;
 
-    println!(
-        " ✓ prompt={:.1}, decode={:.1}, lat={:.0}ms, stable={:.1}%",
-        result.prompt_tps,
-        result.decode_tps,
-        result.latency_ms,
-        result.stability * 100.0
-    );
+    let successful_runs: Vec<_> = runs.iter().filter(|r| !r.failed).collect();
+    if successful_runs.len() >= 2 {
+        let latencies: Vec<f32> = successful_runs.iter().map(|r| r.latency_ms).collect();
+        let latencies_sorted = {
+            let mut v = latencies.clone();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v
+        };
+        let latency_min = latencies_sorted.first().copied().unwrap_or(0.0);
+        let latency_max = latencies_sorted.last().copied().unwrap_or(0.0);
+        let latency_p50 = latencies_sorted[latencies_sorted.len() / 2];
+        let latency_p90 =
+            latencies_sorted[(latencies_sorted.len() as f32 * 0.9) as usize].min(latency_max);
+
+        let variance = if successful_runs.len() > 1 {
+            let mean = latencies.iter().sum::<f32>() / latencies.len() as f32;
+            latencies.iter().map(|l| (l - mean).powi(2)).sum::<f32>()
+                / (successful_runs.len() - 1) as f32
+        } else {
+            0.0
+        };
+        let stddev = variance.sqrt();
+        let cv = if result.latency_ms > 0.0 {
+            (stddev / result.latency_ms) * 100.0
+        } else {
+            0.0
+        };
+
+        let failure_count = runs.iter().filter(|r| r.failed).count();
+        println!(
+            " ✓ p50={:.0}ms, p90={:.0}ms, min={:.0}ms, max={:.0}ms, stddev={:.1}ms, cv={:.1}%, runs={}/{}, failed={}",
+            latency_p50, latency_p90, latency_min, latency_max, stddev, cv,
+            successful_runs.len(), runs.len(), failure_count
+        );
+    } else {
+        println!(
+            " ✓ prompt={:.1}, decode={:.1}, lat={:.0}ms, stable={:.1}%",
+            result.prompt_tps,
+            result.decode_tps,
+            result.latency_ms,
+            result.stability * 100.0
+        );
+    }
 
     Ok(result)
 }
@@ -1860,6 +1901,8 @@ impl BenchCommand {
             temperature,
             top_p,
             stream,
+            parallel,
+            retries,
         ) = if let Some(cfg) = config {
             let perf = &cfg.performance;
             let prompt_tokens = self.args.prompt_tokens.unwrap_or(512);
@@ -1879,6 +1922,8 @@ impl BenchCommand {
             } else {
                 vec!["Write a detailed explanation of quantum computing, covering superposition, entanglement, and quantum gates. Be thorough and include examples.".to_string()]
             };
+            let parallel = self.args.parallel.unwrap_or(1);
+            let retries = self.args.retries.unwrap_or(0);
             (
                 prompt_tokens,
                 generation_tokens,
@@ -1889,19 +1934,25 @@ impl BenchCommand {
                 perf.temperature,
                 perf.top_p,
                 perf.stream,
+                parallel,
+                retries,
             )
         } else {
             let prompt_tokens = self.args.prompt_tokens.unwrap_or(512);
             let generation_tokens = self.args.generation_tokens.unwrap_or(128);
             let warmup = if self.args.quick { 1 } else { 2 };
             let samples = if self.args.quick { 1 } else { 3 };
-            (prompt_tokens, generation_tokens, warmup, samples, vec!["Write a detailed explanation of quantum computing, covering superposition, entanglement, and quantum gates. Be thorough and include examples.".to_string()], 256, 1.0, 1.0, false)
+            let parallel = self.args.parallel.unwrap_or(1);
+            let retries = self.args.retries.unwrap_or(0);
+            (prompt_tokens, generation_tokens, warmup, samples, vec!["Write a detailed explanation of quantum computing, covering superposition, entanglement, and quantum gates. Be thorough and include examples.".to_string()], 256, 1.0, 1.0, false, parallel, retries)
         };
 
         println!("  Prompts: {}", prompts.len());
         println!("  Prompt tokens: {}", prompt_tokens);
         println!("  Generation tokens: {}", generation_tokens);
         println!("  Samples: {} (warmup: {})", samples, warmup);
+        println!("  Parallel: {} requests", parallel);
+        println!("  Retries: {}", retries);
         println!();
 
         if self.args.dry_run {
@@ -1912,91 +1963,134 @@ impl BenchCommand {
         println!("  {} Running performance test...", style.info("→"));
         std::io::stdout().flush()?;
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(parallel)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(60))
+            .build()
+            .map_err(|e| Error::Other {
+                message: format!("Client build failed: {}", e),
+            })?;
 
-        let prompt_base = prompts.first().unwrap();
-        let prompt_base_len = prompt_base.chars().count() as u32;
-
-        let prompt: String = if prompt_base_len < prompt_tokens {
-            prompt_base
-                .repeat((prompt_tokens as usize / prompt_base_len as usize) + 1)
-                .chars()
-                .take(prompt_tokens as usize)
-                .collect()
-        } else {
-            prompt_base.chars().take(prompt_tokens as usize).collect()
+        let prepare_prompt = |prompt_base: &str, target_tokens: u32| -> String {
+            let prompt_base_len = prompt_base.chars().count() as u32;
+            if prompt_base_len < target_tokens {
+                prompt_base
+                    .repeat((target_tokens as usize / prompt_base_len as usize) + 1)
+                    .chars()
+                    .take(target_tokens as usize)
+                    .collect()
+            } else {
+                prompt_base.chars().take(target_tokens as usize).collect()
+            }
         };
 
-        let run_request = async |client: &reqwest::Client,
-                                 url: &str,
-                                 prompt: &str,
-                                 n_predict: u32|
-               -> std::result::Result<(f64, f64, f64), String> {
-            let req = serde_json::json!({
-                "prompt": prompt,
-                "n_predict": n_predict,
-                "temperature": temperature,
-                "top_p": top_p,
-                "stream": stream
-            });
+        let make_request = move || {
+            let temperature = temperature;
+            let top_p = top_p;
+            let stream = stream;
+            let retries = retries;
 
-            let start = std::time::Instant::now();
-            let resp = client
-                .post(url)
-                .json(&req)
-                .timeout(Duration::from_secs(120))
-                .send()
-                .await
-                .map_err(|e| format!("Request failed: {}", e))?;
+            async move |client: &reqwest::Client,
+                        url: &str,
+                        prompt: &str,
+                        n_predict: u32|
+                        -> std::result::Result<(f64, f64, f64, f64, f64, f64), String> {
+                let mut last_error = String::new();
+                for attempt in 0..=retries {
+                    if attempt > 0 {
+                        tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                    }
 
-            let elapsed = start.elapsed().as_secs_f64();
-            let json: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| format!("JSON parse failed: {}", e))?;
+                    let req = serde_json::json!({
+                        "prompt": prompt,
+                        "n_predict": n_predict,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "stream": stream
+                    });
 
-            let tokens_predicted = json
-                .get("tokens_predicted")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as f64;
-            let tokens_evaluated = json
-                .get("tokens_evaluated")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as f64;
-            let predicted_ms = json
-                .get("timings")
-                .and_then(|t| t.get("predicted_ms"))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let prompt_ms = json
-                .get("timings")
-                .and_then(|t| t.get("prompt_ms"))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+                    let start = std::time::Instant::now();
+                    let resp = match client
+                        .post(url)
+                        .json(&req)
+                        .timeout(Duration::from_secs(120))
+                        .send()
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_error = format!("Request failed: {}", e);
+                            continue;
+                        }
+                    };
 
-            let prompt_tps = if prompt_ms > 0.0 {
-                tokens_evaluated / (prompt_ms / 1000.0)
-            } else {
-                0.0
-            };
-            let decode_tps = if predicted_ms > 0.0 {
-                tokens_predicted / (predicted_ms / 1000.0)
-            } else {
-                0.0
-            };
-            let latency_ms = elapsed * 1000.0;
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let json: serde_json::Value = match resp.json().await {
+                        Ok(j) => j,
+                        Err(e) => {
+                            last_error = format!("JSON parse failed: {}", e);
+                            continue;
+                        }
+                    };
 
-            Ok((prompt_tps, decode_tps, latency_ms))
+                    let tokens_predicted = json
+                        .get("tokens_predicted")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as f64;
+                    let tokens_evaluated = json
+                        .get("tokens_evaluated")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as f64;
+                    let predicted_ms = json
+                        .get("timings")
+                        .and_then(|t| t.get("predicted_ms"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let prompt_ms = json
+                        .get("timings")
+                        .and_then(|t| t.get("prompt_ms"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let eval_ms = json
+                        .get("timings")
+                        .and_then(|t| t.get("eval_ms"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+
+                    let prompt_tps = if prompt_ms > 0.0 {
+                        tokens_evaluated / (prompt_ms / 1000.0)
+                    } else {
+                        0.0
+                    };
+                    let decode_tps = if predicted_ms > 0.0 {
+                        tokens_predicted / (predicted_ms / 1000.0)
+                    } else {
+                        0.0
+                    };
+                    let latency_ms = elapsed * 1000.0;
+
+                    return Ok((
+                        prompt_tps,
+                        decode_tps,
+                        latency_ms,
+                        tokens_predicted,
+                        tokens_evaluated,
+                        eval_ms,
+                    ));
+                }
+                Err(last_error)
+            }
         };
 
         let url = format!("{}/completion", base_url);
 
-        let mut results = Vec::new();
-
-        if warmup > 0 {
+        if warmup > 0 && parallel == 1 {
             eprint!("    Warmup: ");
+            let warmup_prompt = prepare_prompt(prompts.first().unwrap(), prompt_tokens);
+            let request = make_request();
             for _ in 0..warmup {
-                let _ = run_request(&client, &url, &prompt, 16).await;
+                let _ = request(&client, &url, &warmup_prompt, 16).await;
                 eprint!(".");
             }
             eprintln!(" done");
@@ -2005,40 +2099,264 @@ impl BenchCommand {
         eprint!("    Testing: ");
         std::io::stdout().flush()?;
 
-        for _ in 0..samples {
-            match run_request(&client, &url, &prompt, generation_tokens).await {
-                Ok((prompt_tps, decode_tps, latency_ms)) => {
-                    results.push((prompt_tps, decode_tps, latency_ms));
-                    eprint!(".");
+        let mut all_results: Vec<(f64, f64, f64, f64, f64, f64)> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        for prompt_base in &prompts {
+            let prompt = prepare_prompt(prompt_base, prompt_tokens);
+            let request = make_request();
+
+            for _ in 0..samples {
+                if parallel > 1 {
+                    let mut handles = Vec::new();
+
+                    for _ in 0..parallel {
+                        let prompt = prompt.clone();
+                        let client = client.clone();
+                        let url = url.clone();
+                        handles.push(tokio::spawn(async move {
+                            let run_req = async |client: &reqwest::Client,
+                                                 url: &str,
+                                                 prompt: &str,
+                                                 n_predict: u32|
+                                   -> std::result::Result<
+                                (f64, f64, f64, f64, f64, f64),
+                                String,
+                            > {
+                                let mut last_error = String::new();
+                                for attempt in 0..=retries {
+                                    if attempt > 0 {
+                                        tokio::time::sleep(Duration::from_millis(
+                                            100 * attempt as u64,
+                                        ))
+                                        .await;
+                                    }
+
+                                    let req = serde_json::json!({
+                                        "prompt": prompt,
+                                        "n_predict": n_predict,
+                                        "temperature": temperature,
+                                        "top_p": top_p,
+                                        "stream": stream
+                                    });
+
+                                    let start = std::time::Instant::now();
+                                    let resp = match client
+                                        .post(url)
+                                        .json(&req)
+                                        .timeout(Duration::from_secs(120))
+                                        .send()
+                                        .await
+                                    {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            last_error = format!("Request failed: {}", e);
+                                            continue;
+                                        }
+                                    };
+
+                                    let elapsed = start.elapsed().as_secs_f64();
+                                    let json: serde_json::Value = match resp.json().await {
+                                        Ok(j) => j,
+                                        Err(e) => {
+                                            last_error = format!("JSON parse failed: {}", e);
+                                            continue;
+                                        }
+                                    };
+
+                                    let tokens_predicted = json
+                                        .get("tokens_predicted")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0)
+                                        as f64;
+                                    let tokens_evaluated = json
+                                        .get("tokens_evaluated")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0)
+                                        as f64;
+                                    let predicted_ms = json
+                                        .get("timings")
+                                        .and_then(|t| t.get("predicted_ms"))
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0);
+                                    let prompt_ms = json
+                                        .get("timings")
+                                        .and_then(|t| t.get("prompt_ms"))
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0);
+                                    let eval_ms = json
+                                        .get("timings")
+                                        .and_then(|t| t.get("eval_ms"))
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0);
+
+                                    let prompt_tps = if prompt_ms > 0.0 {
+                                        tokens_evaluated / (prompt_ms / 1000.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    let decode_tps = if predicted_ms > 0.0 {
+                                        tokens_predicted / (predicted_ms / 1000.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    let latency_ms = elapsed * 1000.0;
+
+                                    return Ok((
+                                        prompt_tps,
+                                        decode_tps,
+                                        latency_ms,
+                                        tokens_predicted,
+                                        tokens_evaluated,
+                                        eval_ms,
+                                    ));
+                                }
+                                Err(last_error)
+                            };
+                            run_req(&client, &url, &prompt, generation_tokens).await
+                        }));
+                    }
+
+                    for handle in handles {
+                        match handle.await {
+                            Ok(Ok(result)) => {
+                                all_results.push(result);
+                                eprint!(".");
+                            }
+                            Ok(Err(e)) => {
+                                errors.push(e);
+                                eprint!("x");
+                            }
+                            Err(_) => {
+                                errors.push("Task join error".to_string());
+                                eprint!("x");
+                            }
+                        }
+                    }
+                } else {
+                    match request(&client, &url, &prompt, generation_tokens).await {
+                        Ok(result) => {
+                            all_results.push(result);
+                            eprint!(".");
+                        }
+                        Err(e) => {
+                            errors.push(e);
+                            eprint!("x");
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("\n    Error: {}", e);
-                }
+                std::io::stdout().flush()?;
             }
-            std::io::stdout().flush()?;
         }
         eprintln!();
 
-        if results.is_empty() {
+        if all_results.is_empty() {
+            for err in &errors {
+                eprintln!("    Error: {}", err);
+            }
             return Err(Error::Other {
                 message: "All tests failed".to_string(),
             });
         }
 
-        let n = results.len() as f64;
-        let avg_prompt: f64 = results.iter().map(|(p, _, _)| p).sum::<f64>() / n;
-        let avg_decode: f64 = results.iter().map(|(_, d, _)| d).sum::<f64>() / n;
-        let avg_latency: f64 = results.iter().map(|(_, _, l)| l).sum::<f64>() / n;
+        let total_samples = samples as usize * prompts.len() * parallel.max(1);
+        let n = all_results.len() as f64;
+        let avg_prompt: f64 = all_results.iter().map(|(p, _, _, _, _, _)| p).sum::<f64>() / n;
+        let avg_decode: f64 = all_results.iter().map(|(_, d, _, _, _, _)| d).sum::<f64>() / n;
+        let avg_latency: f64 = all_results.iter().map(|(_, _, l, _, _, _)| l).sum::<f64>() / n;
+        let total_tokens: f64 = all_results
+            .iter()
+            .map(|(_, _, _, tp, _, _)| *tp)
+            .sum::<f64>()
+            / n;
+        let total_eval_ms: f64 = all_results.iter().map(|(_, _, _, _, _, e)| *e).sum::<f64>() / n;
+
+        let latencies: Vec<f64> = all_results.iter().map(|(_, _, l, _, _, _)| *l).collect();
+        let latency_min = latencies.iter().cloned().fold(f64::INFINITY, f64::min);
+        let latency_max = latencies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        let mut sorted_latencies = latencies.clone();
+        sorted_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let percentile = |p: f64| -> f64 {
+            if all_results.is_empty() {
+                return 0.0;
+            }
+            let idx = ((p / 100.0) * (all_results.len() - 1) as f64).round() as usize;
+            sorted_latencies[idx.min(sorted_latencies.len() - 1)]
+        };
+
+        let latency_p50 = percentile(50.0);
+        let latency_p90 = percentile(90.0);
+        let latency_p95 = percentile(95.0);
+        let latency_p99 = percentile(99.0);
+
+        let variance = latencies
+            .iter()
+            .map(|l| (l - avg_latency).powi(2))
+            .sum::<f64>()
+            / n;
+        let latency_stddev = variance.sqrt();
+        let latency_cv = if avg_latency > 0.0 {
+            (latency_stddev / avg_latency) * 100.0
+        } else {
+            0.0
+        };
+
+        let tps_values: Vec<f64> = all_results.iter().map(|(p, d, _, _, _, _)| p + d).collect();
+        let tps_min = tps_values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let tps_max = tps_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        let stability = if latency_cv < 10.0 {
+            "high"
+        } else if latency_cv < 25.0 {
+            "medium"
+        } else {
+            "low"
+        };
 
         println!();
         println!("  {} Results:", style.success("✓"));
-        println!("    Prompt processing: {:.1} tokens/sec", avg_prompt);
-        println!("    Token generation: {:.1} tokens/sec", avg_decode);
-        println!("    Latency: {:.0} ms", avg_latency);
+        println!();
+        println!("  === Summary ===");
         println!(
-            "    Total throughput: {:.1} tokens/sec",
+            "    Runs: {}/{} ({}% success)",
+            all_results.len(),
+            total_samples,
+            (all_results.len() as f64 / total_samples as f64 * 100.0) as usize
+        );
+        if !errors.is_empty() {
+            println!("    Errors: {} (retries={})", errors.len(), retries);
+        }
+        println!();
+        println!("  === Latency ===");
+        println!("    Mean:   {:.2} ms", avg_latency);
+        println!("    Min:    {:.2} ms", latency_min);
+        println!("    Max:    {:.2} ms", latency_max);
+        println!("    p50:    {:.2} ms", latency_p50);
+        println!("    p90:    {:.2} ms", latency_p90);
+        println!("    p95:    {:.2} ms", latency_p95);
+        println!("    p99:    {:.2} ms", latency_p99);
+        println!("    StdDev: {:.2} ms", latency_stddev);
+        println!("    CV:     {:.2}% ({})", latency_cv, stability);
+        println!();
+        println!("  === Throughput ===");
+        println!("    Prompt processing: {:.1} tokens/sec", avg_prompt);
+        println!("    Token generation:  {:.1} tokens/sec", avg_decode);
+        println!(
+            "    Total:              {:.1} tokens/sec",
             avg_prompt + avg_decode
         );
+        println!(
+            "    Range:              {:.1} - {:.1} tokens/sec",
+            tps_min, tps_max
+        );
+        if parallel > 1 {
+            println!();
+            println!("  === Concurrent Load ({} parallel) ===", parallel);
+            println!("    Tokens generated: {:.0} avg", total_tokens);
+            println!("    Eval time:       {:.2} ms avg", total_eval_ms);
+        }
 
         Ok(())
     }

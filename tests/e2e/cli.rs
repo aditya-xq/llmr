@@ -37,7 +37,7 @@ fn test_cli_serve_no_model_interactive() {
     cmd.arg("serve")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Select model"));
+        .stdout(predicate::str::contains("Searching for GGUF models"));
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn test_cli_tune_requires_model() {
     cmd.arg("tune")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Select model"));
+        .stdout(predicate::str::contains("Searching for GGUF models"));
 }
 
 #[test]

@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::{cmp::Reverse, ffi::OsStr};
+
+#[cfg(target_os = "windows")]
+use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
