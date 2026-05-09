@@ -1,0 +1,7 @@
+- Add support for vLLM and SGLang.
+- Improve tuning and benchmarking.
+- Create llmr web cmd for a web interface for accessing all llmr features and creating evals and configs for better benchmarking
+- Add chat ui wrapper for web to enable user to pick any open source chat ui to use, on demand.
+- Add analytics and usage dashboard to llmr web.
+- Check for additional token and inference optimizations
+- Add a way to create, configure and test agent harnesses over bounded tasks and workflows via the bench cmd.
