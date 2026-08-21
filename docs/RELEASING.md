@@ -6,25 +6,37 @@ This guide explains how releases work — in plain language — for maintainers 
 
 ## For Maintainers: How to Cut a Release
 
-You need one command:
+### The normal way: merge your release PR
 
-```powershell
-./scripts/bump.ps1 1.2.3 -Push
-```
+1. **Prepare develop** — Land all features on develop as usual. When a batch is ready for release, set the version in `Cargo.toml` to the next version (e.g., `1.2.0`).
+2. **Raise the release PR** — Open a PR from `develop` to `main`. CI validates the whole batch. Only `develop` may be merged into `main`; any other source branch is blocked by a required check.
+3. **Merge it** — Merging triggers everything automatically:
+   - The **Tag Release** workflow sees the new version in `Cargo.toml`, creates the `v1.2.0` tag on main, and starts the pipeline.
+   - The **Release** workflow builds 5 targets in parallel (Windows x64, Linux x64/arm64, macOS x64/arm64), packages each as `llmr-<target-triple>.<zip|tar.gz>` with sha256 checksums, and opens a **draft** GitHub release.
+   - The **Sync Develop** workflow merges main back into develop, so the next cycle starts clean.
+4. **You review** — Open the draft on the [Releases page](https://github.com/aditya-xq/llmr/releases), read the notes, and click **Publish** when happy. Nothing is public until you do this.
+5. **Automatic verification** — Publishing triggers the **Release Verify** workflow, which checks that every download link actually works.
 
-That's it. Here is what happens, step by step:
+If you forgot to bump `Cargo.toml` before merging, nothing happens (the tag already exists) — just run `./scripts/bump.ps1 X.Y.Z -Push` on main to cut the release manually.
 
-1. **Version bump** — The script sets the version in `Cargo.toml` to `1.2.3`, refreshes `Cargo.lock`, commits as `chore(release): v1.2.3`, creates an annotated git tag `v1.2.3`, and pushes both to GitHub.
-2. **CI validates** — Pushing the tag starts the **Release** workflow. First it checks that the tag matches the version in `Cargo.toml` (if they don't match, everything stops — no bad release can happen) and that the code compiles.
-3. **Five builds in parallel** — GitHub's servers build llmr for every supported platform at once:
-   - Windows x64
-   - Linux x64 and Linux ARM64
-   - macOS Intel and macOS Apple Silicon
+### Choosing major, minor, or patch
 
-   Each build produces a package named after its Rust target triple, for example `llmr-x86_64-pc-windows-msvc.zip`, plus a sha256 checksum file.
-4. **Draft release** — All packages are collected, a `checksums.txt` is generated, and a **draft** (private, not yet public) GitHub release is created with automatic release notes.
-5. **You review** — Open the draft on the [Releases page](https://github.com/aditya-xq/llmr/releases), read the notes, and click **Publish** when happy. Nothing is public until you do this.
-6. **Automatic verification** — Publishing triggers the **Release Verify** workflow, which checks that every download link actually works. If any asset is broken, CI turns red immediately.
+You don't guess — CI checks it. The **release-version** required check on every release PR reads all commits since the last tag and computes what the version must be:
+
+| Commits in this batch | Required bump | Example |
+|---|---|---|
+| Any `BREAKING CHANGE:` footer or `type!:` subject | **major** | `1.4.2` → `2.0.0` |
+| At least one `feat:` | **minor** | `1.4.2` → `1.5.0` |
+| Only `fix:` / `perf:` (plus chores/docs) | **patch** | `1.4.2` → `1.4.3` |
+| Only `chore:` / `docs:` / `ci:` etc. | **no release** — keep version unchanged | `1.4.2` → `1.4.2` |
+
+The PR cannot merge until `Cargo.toml` matches what the commits say — so write commit messages in conventional style (`feat:`, `fix(scope):`, ...) and the right version is always obvious. To override deliberately (e.g., jump straight to a chosen version), add the **`skip-version-check`** label to the release PR.
+
+### Rules to remember
+
+- All changes reach main **through develop**. Direct pushes to main will break the sync job loudly — by design.
+- `Cargo.toml` is the single source of truth for versions. Bump it as part of release prep; never edit tags by hand.
+- Never edit an already-published release's assets. Cut a new version instead.
 
 ### Testing pipeline changes (without releasing)
 
@@ -36,11 +48,28 @@ In the GitHub Actions tab, run the **Release** workflow manually with dry-run en
 - **Wrong version tagged**: delete the tag (`git push origin :refs/tags/vX.Y.Z` and `git tag -d vX.Y.Z`), fix the version, re-tag. Draft releases from failed attempts should be deleted manually.
 - **A download link is broken after publishing**: Release Verify will show exactly which asset failed.
 
-### Rules to remember
+### Optional production hardening (one-time setup)
 
-- `Cargo.toml` is the single source of truth for versions. Never edit tags by hand without bumping it.
-- Releases only happen through tags. Merging to `main` does nothing by itself.
-- Never edit an already-published release's assets. Cut a new version instead.
+Everything below is **off by default** — the pipeline stays fully green without it, and each piece activates itself when you add its configuration.
+
+**macOS code signing & notarization** (removes Gatekeeper warnings on macOS):
+
+1. Join the Apple Developer Program; create a **Developer ID Application** certificate
+2. Export it as `.p12`, base64-encode it (`base64 -i cert.p12 | pbcopy`)
+3. Create an App-Specific Password at appleid.apple.com
+4. Add repository secrets: `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`
+
+The next release build signs with hardened runtime, submits to Apple notarization, and waits for approval. Without the secrets, builds are simply unsigned.
+
+**Homebrew tap** (`brew install aditya-xq/llmr/llmr`):
+
+1. Create a public repo named `homebrew-llmr` under your account (can be empty)
+2. Create a fine-grained PAT with read/write `contents` on that repo only
+3. Set variable `HOMEBREW_TAP_REPOSITORY` = `aditya-xq/homebrew-llmr` and secret `HOMEBREW_TAP_TOKEN` = the PAT
+
+After every published release, the workflow generates `Formula/llmr.rb` with correct URLs and sha256s and pushes it to the tap.
+
+**Windows Authenticode signing**: deliberately deferred — it requires choosing a certificate vendor (EV cert or Azure Trusted Signing). Decide when Windows SmartScreen warnings become a real user problem; the pipeline will get a conditional step like the macOS one.
 
 ---
 
@@ -49,13 +78,19 @@ In the GitHub Actions tab, run the **Release** workflow manually with dry-run en
 ### Install (macOS / Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aditya-xq/llmr/develop/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aditya-xq/llmr/main/install.sh | sh
 ```
 
 ### Install (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/aditya-xq/llmr/develop/install.ps1 | iex
+irm https://raw.githubusercontent.com/aditya-xq/llmr/main/install.ps1 | iex
+```
+
+Or with cargo-binstall (uses the same release assets):
+
+```bash
+cargo binstall llmr
 ```
 
 The installer figures out your operating system and processor type automatically, downloads the right prebuilt binary from the latest GitHub release, puts it on your PATH, and checks that Docker and Python are available.
@@ -73,7 +108,13 @@ $env:VERSION = "1.2.3"; .\install.ps1   # Windows PowerShell
 
 ### Verify a download (optional)
 
-Every release includes a `checksums.txt` file. After downloading an archive, compare its sha256 hash against that file to confirm it wasn't corrupted or tampered with.
+The installers verify every download automatically against `checksums.txt` before extracting — a corrupted or tampered archive is refused. To check manually, compare your download's sha256 against `checksums.txt`.
+
+Every release asset also carries a cryptographically signed **build provenance attestation** (proving exactly which commit built it). Verify with:
+
+```bash
+gh attestation verify llmr-x86_64-apple-darwin.tar.gz -R aditya-xq/llmr
+```
 
 ### Build from source instead
 

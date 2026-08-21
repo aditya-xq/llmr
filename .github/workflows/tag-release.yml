@@ -1,0 +1,57 @@
+name: Tag Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Tag if Cargo.toml version is unreleased
+        id: tag
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+          tag="v${version}"
+          echo "Cargo.toml version: ${version}"
+
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists - nothing to release"
+            exit 0
+          fi
+
+          latest="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)"
+          if [ -n "$latest" ]; then
+            higher="$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -n1)"
+            if [ "$higher" != "$version" ]; then
+              echo "::error::Cargo.toml version ${version} is older than latest tag v${latest} - refusing to tag"
+              exit 1
+            fi
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" -m "Release ${tag}"
+          git push origin "${tag}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Release workflow for the new tag
+        if: steps.tag.outputs.tag != ''
+        run: gh workflow run release.yml --ref "${{ steps.tag.outputs.tag }}" -f dry_run=false
+        env:
+          GH_TOKEN: ${{ github.token }}

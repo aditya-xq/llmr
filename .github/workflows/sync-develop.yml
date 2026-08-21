@@ -1,0 +1,42 @@
+name: Sync Develop
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-develop
+  cancel-in-progress: false
+
+jobs:
+  back-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Merge main back into develop
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main
+
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "develop already contains main - nothing to do"
+            exit 0
+          fi
+
+          echo "Merging origin/main into develop..."
+          if ! git merge --no-edit origin/main; then
+            echo "::error::Merge conflict between main and develop. Resolve manually: git checkout develop && git merge origin/main"
+            exit 1
+          fi
+
+          git push origin develop
