@@ -31,21 +31,27 @@ RUST_LOG=debug cargo run -- serve --model /path/to/model.gguf --dry-run
 2. Create a feature branch (`git checkout -b feature/xyz`)
 3. Make your changes
 4. Run tests and formatting (`cargo fmt && cargo clippy -- -D warnings && cargo test`)
-5. Commit with clear messages
+5. Commit with conventional-commit messages (below)
 6. Push to your fork
-7. Submit a pull request
+7. Submit a pull request **targeting `develop`**
+
+Only `develop` may be merged into `main`; releases ride that path automatically (see [docs/RELEASING.md](docs/RELEASING.md)).
 
 ## CI
 
 Every PR runs `cargo fmt --check`, `cargo clippy -- -D warnings`, compiles all test suites, executes Docker-free unit tests, runs a dependency security audit, and validates commit messages against conventional-commit format (see `.github/workflows/check.yml`). Integration/e2e tests that require Docker are not run in CI — run them locally with `cargo test`.
 
-Commit subjects must follow `<type>(<scope>): <summary>` — releases derive semver versions from these messages. See the "Release & Commit Discipline" section in AGENTS.md for the full contract.
-
 ## Commit Messages
 
-- Use clear, descriptive messages
-- Start with a verb (Add, Fix, Update, Remove)
-- Reference issues when applicable
+Subjects must follow `<type>(<scope>): <summary>` — CI enforces this and release versions are derived from them:
+
+```
+feat(cli): add --port flag          # minor bump
+fix(hardware): normalize MiB units  # patch bump
+chore(deps): bump tokio to 1.52     # no release impact
+```
+
+Allowed types: `feat` `fix` `perf` `revert` `chore` `docs` `style` `refactor` `test` `build` `ci`. Breaking changes append `!` before the colon (`feat!:`) or add a `BREAKING CHANGE:` footer — either forces a major bump.
 
 ## Testing
 

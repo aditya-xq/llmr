@@ -40,7 +40,7 @@ CI derives releases from git history and `Cargo.toml`. These rules are load-bear
 ### Versions
 - Bump `Cargo.toml` when preparing a release batch, matching what the batch's commits imply: breaking → major, any `feat` → minor, only `fix`/`perf` → patch, chores/docs/ci only → no bump. Commit `Cargo.lock` alongside.
 - `release-version` check enforces exact agreement; override only with the `skip-version-check` label on the release PR
-- Tags and releases are created by CI from `Cargo.toml`. Do not hand-create tags (`scripts/bump.ps1` on main is the one sanctioned manual path)
+- Tags and releases are created by CI from `Cargo.toml`. Do not hand-create tags; the one sanctioned manual path is an annotated tag on main pushed by hand (the Release workflow fires on the tag push)
 
 ### Before every push
 ```bash
@@ -242,7 +242,7 @@ src/
 ## Pitfalls: Release Artifact Names Are a Contract with Installers
 - **Situation**: Changing how release assets are named or packaged
 - **Lesson**: `install.sh`/`install.ps1` build download URLs from Rust target triples (`llmr-<triple>.tar.gz|zip`, binary at archive root); any producer of release assets must match that contract exactly or users get 404s
-- **Example**: `release.ps1` once produced `llmr-windows-x86_64.zip` while installers requested `llmr-x86_64-pc-windows-msvc.zip`
+- **Example**: the removed local `release.ps1` once produced `llmr-windows-x86_64.zip` while installers requested `llmr-x86_64-pc-windows-msvc.zip`
 
 ## Workflow: WhatIf Does Not Stop Native Commands
 - **Situation**: Adding `-WhatIf` support to PowerShell scripts that call native executables (cargo, git, docker)

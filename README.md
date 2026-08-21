@@ -144,10 +144,12 @@ cargo build --release
 cargo test
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for commit conventions and the PR flow.
+
 ## Releasing (maintainers)
 
-Releases are automated: bump the version in `Cargo.toml` on `develop`, merge the release PR into `main`, and CI does the rest — tags, 5-target builds with sha256 checksums, and a **draft** GitHub release for you to review and publish. Only `develop` may be merged into `main`, and main is synced back into develop automatically after every merge.
+Releases are fully automated. Run the **Release Train** workflow from the Actions tab (or `gh workflow run release-train.yml`): it derives the version from conventional commits, bumps `Cargo.toml`, opens the release PR with auto-merge armed, and merging it triggers everything else — tagging, 5-target builds with sha256 checksums and provenance attestations, and a **draft** GitHub release for review and publish.
 
-Manual fallback: `./scripts/bump.ps1 1.2.0 -Push` on main. To test pipeline changes without cutting a release, run the Release workflow manually from the Actions tab (dry-run mode).
+Only `develop` may be merged into `main`; main is synced back into develop automatically after every merge. To test pipeline changes without cutting a release, run the Release workflow manually from the Actions tab (dry-run mode).
 
-Full step-by-step guide for maintainers and end users: [docs/RELEASING.md](docs/RELEASING.md).
+Full step-by-step guide: [docs/RELEASING.md](docs/RELEASING.md).
