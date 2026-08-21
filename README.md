@@ -7,9 +7,24 @@ A tiny CLI that runs GGUF models through llama.cpp Docker servers with automatic
 ## Quick Start
 
 ```bash
-# Install
-cargo install --path .
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/aditya-xq/llmr/develop/install.sh | sh
+```
 
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/aditya-xq/llmr/develop/install.ps1 | iex
+```
+
+Or build from source:
+
+```bash
+cargo install --path .
+```
+
+Then:
+
+```bash
 # Go (auto-finds GGUF models, detects hardware, optimizes settings)
 llmr serve
 ```
@@ -128,3 +143,15 @@ Config lives at `~/.config/llmr/` (Linux), `~/Library/Application Support/llmr/`
 cargo build --release
 cargo test
 ```
+
+## Releasing (maintainers)
+
+Releases are fully automated via GitHub Actions — triggered by pushing a `v*` tag:
+
+```bash
+./scripts/bump.ps1 1.2.0 -Push   # bump Cargo.toml, commit, tag, push
+```
+
+The pipeline then: validates the tag matches `Cargo.toml`, builds 5 targets in parallel (Windows x64, Linux x64/arm64, macOS x64/arm64), packages each as `llmr-<target-triple>.<zip|tar.gz>` with sha256 checksums, and opens a **draft** GitHub release. Review and publish the draft; a follow-up workflow verifies every asset URL is downloadable.
+
+`scripts/release.ps1` remains available for local packaging smoke tests. To test pipeline changes without cutting a release, run the Release workflow manually from the Actions tab (dry-run mode).
