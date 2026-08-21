@@ -50,8 +50,12 @@ jobs:
           last_tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
           if [ -n "$last_tag" ]; then
             range="${last_tag}..HEAD"
+            # Bump from the last *released* version, not Cargo.toml, which may
+            # already carry an unreleased bump.
+            base="${last_tag#v}"
           else
             range="HEAD"
+            base="$cargo_version"
           fi
 
           log="$(git log --no-merges --format='%s%n%b' $range)"
@@ -69,7 +73,7 @@ jobs:
             level="$override"
           fi
 
-          IFS=. read -r a b c <<<"$cargo_version"
+          IFS=. read -r a b c <<<"$base"
           case "$level" in
             major) next="$((a + 1)).0.0" ;;
             minor) next="$a.$((b + 1)).0" ;;
@@ -90,7 +94,7 @@ jobs:
             echo "|---|---|"
             echo "| Last tag | \`${last_tag:-<none>}\` |"
             echo "| Commits suggest | **${level}** |"
-            echo "| Version | \`${cargo_version}\` -> \`${next}\` |"
+            echo "| Version | \`${base}\` -> \`${next}\` (Cargo.toml currently \`${cargo_version}\`) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set version in Cargo.toml and Cargo.lock
