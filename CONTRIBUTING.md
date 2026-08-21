@@ -37,13 +37,9 @@ RUST_LOG=debug cargo run -- serve --model /path/to/model.gguf --dry-run
 
 ## CI
 
-<<<<<<< HEAD
 Every PR runs `cargo fmt --check`, `cargo clippy -- -D warnings`, compiles all test suites, executes Docker-free unit tests, runs a dependency security audit, and validates commit messages against conventional-commit format (see `.github/workflows/check.yml`). Integration/e2e tests that require Docker are not run in CI — run them locally with `cargo test`.
 
 Commit subjects must follow `<type>(<scope>): <summary>` — releases derive semver versions from these messages. See the "Release & Commit Discipline" section in AGENTS.md for the full contract.
-=======
-Every PR runs `cargo fmt --check`, `cargo clippy -- -D warnings`, compiles all test suites, executes Docker-free unit tests, and runs a dependency security audit (see `.github/workflows/check.yml`). Integration/e2e tests that require Docker are not run in CI — run them locally with `cargo test`.
->>>>>>> origin/main
 
 ## Commit Messages
 
