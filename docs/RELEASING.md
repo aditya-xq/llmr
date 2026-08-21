@@ -19,6 +19,19 @@ This guide explains how releases work — in plain language — for maintainers 
 
 If you forgot to bump `Cargo.toml` before merging, nothing happens (the tag already exists) — just run `./scripts/bump.ps1 X.Y.Z -Push` on main to cut the release manually.
 
+### Choosing major, minor, or patch
+
+You don't guess — CI checks it. The **release-version** required check on every release PR reads all commits since the last tag and computes what the version must be:
+
+| Commits in this batch | Required bump | Example |
+|---|---|---|
+| Any `BREAKING CHANGE:` footer or `type!:` subject | **major** | `1.4.2` → `2.0.0` |
+| At least one `feat:` | **minor** | `1.4.2` → `1.5.0` |
+| Only `fix:` / `perf:` (plus chores/docs) | **patch** | `1.4.2` → `1.4.3` |
+| Only `chore:` / `docs:` / `ci:` etc. | **no release** — keep version unchanged | `1.4.2` → `1.4.2` |
+
+The PR cannot merge until `Cargo.toml` matches what the commits say — so write commit messages in conventional style (`feat:`, `fix(scope):`, ...) and the right version is always obvious. To override deliberately (e.g., jump straight to a chosen version), add the **`skip-version-check`** label to the release PR.
+
 ### Rules to remember
 
 - All changes reach main **through develop**. Direct pushes to main will break the sync job loudly — by design.

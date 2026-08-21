@@ -1,0 +1,85 @@
+name: Version Check
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  release-version:
+    name: release-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine expected version from commits
+        run: |
+          set -euo pipefail
+
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+          echo "Cargo.toml version: ${cargo_version}"
+
+          last_tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          if [ -z "$last_tag" ]; then
+            echo "::notice::No previous release tags found - trusting Cargo.toml version"
+            exit 0
+          fi
+          last_ver="${last_tag#v}"
+          echo "Last release: ${last_tag}"
+
+          log="$(git log --no-merges --format='%s%n%b' "${last_tag}..HEAD")"
+
+          level="none"
+          if printf '%s\n' "$log" | grep -qE '^[a-zA-Z]+(\(.+\))?!:' || printf '%s\n' "$log" | grep -q '^BREAKING CHANGE'; then
+            level="major"
+          elif printf '%s\n' "$log" | grep -qE '^feat(\(.+\))?:'; then
+            level="minor"
+          elif printf '%s\n' "$log" | grep -qE '^(fix|perf)(\(.+\))?:'; then
+            level="patch"
+          fi
+          echo "Suggested bump from conventional commits: ${level}"
+
+          IFS=. read -r a b c <<<"$last_ver"
+          case "$level" in
+            major) expected="$((a + 1)).0.0" ;;
+            minor) expected="$a.$((b + 1)).0" ;;
+            patch) expected="$a.$b.$((c + 1))" ;;
+            none)  expected="$last_ver" ;;
+          esac
+
+          {
+            echo "### Version check"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Last release | \`${last_tag}\` |"
+            echo "| Commits suggest | **${level}** bump |"
+            echo "| Expected version | \`${expected}\` |"
+            echo "| Cargo.toml says | \`${cargo_version}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'skip-version-check') }}" = "true" ]; then
+            echo "::warning::skip-version-check label set - skipping enforcement (expected ${expected}, got ${cargo_version})"
+            exit 0
+          fi
+
+          if [ "$cargo_version" = "$expected" ]; then
+            if [ "$level" = "none" ]; then
+              echo "::notice::No release-worthy commits - merging will NOT create a release"
+            else
+              echo "::notice::Merging will release v${cargo_version} (${level})"
+            fi
+            exit 0
+          fi
+
+          if [ "$level" = "none" ]; then
+            echo "::error::No feat/fix/perf commits in this batch, so Cargo.toml should stay at ${last_ver}. Found ${cargo_version}. Revert the version, or add the 'skip-version-check' label to override."
+          else
+            echo "::error::Commits since ${last_tag} suggest a ${level} bump: Cargo.toml should be ${expected}, but is ${cargo_version}. Fix the version, use correct commit prefixes, or add the 'skip-version-check' label to override."
+          fi
+          exit 1
