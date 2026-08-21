@@ -101,7 +101,7 @@ jobs:
           $asset = "llmr-${{ matrix.target }}.zip"
           Compress-Archive -Path "target/${{ matrix.target }}/release/llmr.exe" -DestinationPath $asset -Force
           $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -Path "$asset.sha256" -Value "$hash  $asset"
+          [System.IO.File]::WriteAllText("$asset.sha256", "$hash  $asset`n")
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
