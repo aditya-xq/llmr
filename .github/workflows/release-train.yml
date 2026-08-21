@@ -1,0 +1,169 @@
+name: Release Train
+
+# One command: bumps the version from conventional commits, pushes it to
+# develop, opens (or refreshes) the release PR to main, and arms auto-merge.
+# Merging that PR is all a maintainer does; tag-release + Release finish the job.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver level override (default: derived from conventional commits)"
+        type: choice
+        default: auto
+        options: [auto, major, minor, patch]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-train
+  cancel-in-progress: false
+
+env:
+  DEVELOP: develop
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      level: ${{ steps.bump.outputs.level }}
+      next: ${{ steps.bump.outputs.next }}
+      current: ${{ steps.bump.outputs.current }}
+      pr: ${{ steps.pr.outputs.number }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: develop
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute version bump
+        id: bump
+        run: |
+          set -euo pipefail
+          override="${{ inputs.bump }}"
+
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+
+          last_tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          if [ -n "$last_tag" ]; then
+            range="${last_tag}..HEAD"
+            # Bump from the last *released* version, not Cargo.toml, which may
+            # already carry an unreleased bump.
+            base="${last_tag#v}"
+          else
+            range="HEAD"
+            base="$cargo_version"
+          fi
+
+          log="$(git log --no-merges --format='%s%n%b' $range)"
+
+          level="none"
+          if printf '%s\n' "$log" | grep -qE '^[a-zA-Z]+(\(.+\))?!:' || printf '%s\n' "$log" | grep -q '^BREAKING CHANGE'; then
+            level="major"
+          elif printf '%s\n' "$log" | grep -qE '^feat(\(.+\))?:'; then
+            level="minor"
+          elif printf '%s\n' "$log" | grep -qE '^(fix|perf)(\(.+\))?:'; then
+            level="patch"
+          fi
+
+          if [ -n "$override" ] && [ "$override" != "auto" ]; then
+            level="$override"
+          fi
+
+          IFS=. read -r a b c <<<"$base"
+          case "$level" in
+            major) next="$((a + 1)).0.0" ;;
+            minor) next="$a.$((b + 1)).0" ;;
+            patch) next="$a.$b.$((c + 1))" ;;
+            none)  next="$cargo_version" ;;
+          esac
+
+          {
+            echo "level=${level}"
+            echo "next=${next}"
+            echo "current=${cargo_version}"
+            echo "last_tag=${last_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Release train"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Last tag | \`${last_tag:-<none>}\` |"
+            echo "| Commits suggest | **${level}** |"
+            echo "| Version | \`${base}\` -> \`${next}\` (Cargo.toml currently \`${cargo_version}\`) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set version in Cargo.toml and Cargo.lock
+        if: steps.bump.outputs.next != steps.bump.outputs.current
+        run: |
+          set -euo pipefail
+          sed -i '0,/^version = "\(.*\)"/s//version = "'"${{ steps.bump.outputs.next }}"'"/' Cargo.toml
+          grep -m1 '^version' Cargo.toml
+          cargo update --workspace --quiet
+          git diff --stat
+
+      - name: Commit and push to develop
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          next="${{ steps.bump.outputs.next }}"
+          current="${{ steps.bump.outputs.current }}"
+          if [ "$next" != "$current" ]; then
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore(release): v${next}"
+          fi
+
+          ok=0
+          for _ in 1 2 3; do
+            if git pull --rebase origin "${DEVELOP}" >/dev/null 2>&1 && git push origin HEAD:"${DEVELOP}" >/dev/null 2>&1; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          [ "$ok" = "1" ] || { echo "::error::could not push to ${DEVELOP} after retries"; git status; exit 1; }
+
+      - name: Open or refresh release PR with auto-merge
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LEVEL: ${{ steps.bump.outputs.level }}
+          NEXT: ${{ steps.bump.outputs.next }}
+          CURRENT: ${{ steps.bump.outputs.current }}
+        run: |
+          set -euo pipefail
+
+          title="chore(release): v${NEXT}"
+          body="$(cat <<EOF
+          ## Release train: v${NEXT}
+
+          Bump level **${LEVEL}** derived from conventional commits on \`${DEVELOP}\`.
+
+          - Cargo.toml: \`${CURRENT}\` -> \`${NEXT}\`
+          - On merge: Tag Release tags \`v${NEXT}\`, Release builds all platforms and publishes a draft.
+
+          > Auto-merge is enabled - this PR merges itself once checks pass.
+          EOF
+          )"
+
+          existing="$(gh pr list --base main --head "${DEVELOP}" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "$title" --body "$body"
+            number="$existing"
+          else
+            if [ "$LEVEL" = "none" ]; then
+              echo "::notice::Nothing release-worthy and no open release PR - done"
+              exit 0
+            fi
+            number="$(gh pr create --base main --head "${DEVELOP}" --title "$title" --body "$body" --label skip-version-check)"
+          fi
+          echo "number=${number}" >> "$GITHUB_OUTPUT"
+
+          gh pr merge "$number" --squash --auto \
+            || echo "::warning::auto-merge unavailable (repo setting?) - PR #${number} left open for manual merge"
