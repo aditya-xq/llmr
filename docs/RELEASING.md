@@ -48,6 +48,29 @@ In the GitHub Actions tab, run the **Release** workflow manually with dry-run en
 - **Wrong version tagged**: delete the tag (`git push origin :refs/tags/vX.Y.Z` and `git tag -d vX.Y.Z`), fix the version, re-tag. Draft releases from failed attempts should be deleted manually.
 - **A download link is broken after publishing**: Release Verify will show exactly which asset failed.
 
+### Optional production hardening (one-time setup)
+
+Everything below is **off by default** — the pipeline stays fully green without it, and each piece activates itself when you add its configuration.
+
+**macOS code signing & notarization** (removes Gatekeeper warnings on macOS):
+
+1. Join the Apple Developer Program; create a **Developer ID Application** certificate
+2. Export it as `.p12`, base64-encode it (`base64 -i cert.p12 | pbcopy`)
+3. Create an App-Specific Password at appleid.apple.com
+4. Add repository secrets: `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`
+
+The next release build signs with hardened runtime, submits to Apple notarization, and waits for approval. Without the secrets, builds are simply unsigned.
+
+**Homebrew tap** (`brew install aditya-xq/llmr/llmr`):
+
+1. Create a public repo named `homebrew-llmr` under your account (can be empty)
+2. Create a fine-grained PAT with read/write `contents` on that repo only
+3. Set variable `HOMEBREW_TAP_REPOSITORY` = `aditya-xq/homebrew-llmr` and secret `HOMEBREW_TAP_TOKEN` = the PAT
+
+After every published release, the workflow generates `Formula/llmr.rb` with correct URLs and sha256s and pushes it to the tap.
+
+**Windows Authenticode signing**: deliberately deferred — it requires choosing a certificate vendor (EV cert or Azure Trusted Signing). Decide when Windows SmartScreen warnings become a real user problem; the pipeline will get a conditional step like the macOS one.
+
 ---
 
 ## For End Users: How to Install and Update
@@ -55,13 +78,19 @@ In the GitHub Actions tab, run the **Release** workflow manually with dry-run en
 ### Install (macOS / Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aditya-xq/llmr/develop/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aditya-xq/llmr/main/install.sh | sh
 ```
 
 ### Install (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/aditya-xq/llmr/develop/install.ps1 | iex
+irm https://raw.githubusercontent.com/aditya-xq/llmr/main/install.ps1 | iex
+```
+
+Or with cargo-binstall (uses the same release assets):
+
+```bash
+cargo binstall llmr
 ```
 
 The installer figures out your operating system and processor type automatically, downloads the right prebuilt binary from the latest GitHub release, puts it on your PATH, and checks that Docker and Python are available.
@@ -79,7 +108,13 @@ $env:VERSION = "1.2.3"; .\install.ps1   # Windows PowerShell
 
 ### Verify a download (optional)
 
-Every release includes a `checksums.txt` file. After downloading an archive, compare its sha256 hash against that file to confirm it wasn't corrupted or tampered with.
+The installers verify every download automatically against `checksums.txt` before extracting — a corrupted or tampered archive is refused. To check manually, compare your download's sha256 against `checksums.txt`.
+
+Every release asset also carries a cryptographically signed **build provenance attestation** (proving exactly which commit built it). Verify with:
+
+```bash
+gh attestation verify llmr-x86_64-apple-darwin.tar.gz -R aditya-xq/llmr
+```
 
 ### Build from source instead
 

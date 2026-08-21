@@ -117,6 +117,41 @@ download_url() {
     fi
 }
 
+verify_checksum() {
+    local archive="$1"
+    local version="$2"
+    local os="$3"
+    local arch="$4"
+
+    if ! ensure_command sha256sum; then
+        warn "sha256sum not found - skipping checksum verification"
+        return 0
+    fi
+
+    local sums_url
+    if [ "$version" = "latest" ]; then
+        sums_url="https://github.com/${GITHUB_REPO}/releases/latest/download/checksums.txt"
+    else
+        sums_url="https://github.com/${GITHUB_REPO}/releases/download/v${version}/checksums.txt"
+    fi
+
+    local asset expected actual
+    asset="$(asset_name "$os" "$arch")"
+    if ! expected="$(curl -fsSL --retry 3 --retry-delay 2 "$sums_url" | awk -v a="$asset" '$NF == a {print $1}')" || [ -z "$expected" ]; then
+        err "Could not fetch or parse checksums.txt for ${asset} - refusing to install"
+        return 1
+    fi
+
+    actual="$(sha256sum "$archive" | cut -d' ' -f1)"
+    if [ "$actual" != "$expected" ]; then
+        err "Checksum mismatch for ${asset}"
+        err "  expected: ${expected}"
+        err "  actual:   ${actual}"
+        return 1
+    fi
+    ok "Checksum verified"
+}
+
 current_version() {
     local binary="$1"
     if [ -x "$binary" ]; then
@@ -181,6 +216,7 @@ install_binary() {
 
     mkdir -p "$INSTALL_DIR" "$STATE_DIR"
     curl -fL --retry 3 --retry-delay 2 -o "$archive" "$url"
+    verify_checksum "$archive" "$version" "$os" "$arch"
 
     if [[ "$archive" == *.zip ]]; then
         ensure_command unzip || { err "unzip is required to extract ${archive}"; return 1; }

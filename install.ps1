@@ -120,6 +120,41 @@ function Get-DownloadUrl {
     return "https://github.com/$GitHubRepo/releases/download/v$ReleaseVersion/$BinaryName-x86_64-pc-windows-msvc.zip"
 }
 
+function Test-ArchiveChecksum {
+    param([string]$ArchivePath, [string]$ReleaseVersion)
+
+    $base = "https://github.com/$GitHubRepo/releases"
+    $sumsUrl = if ($ReleaseVersion -eq "latest") {
+        "$base/latest/download/checksums.txt"
+    } else {
+        "$base/download/v$ReleaseVersion/checksums.txt"
+    }
+
+    $asset = "$BinaryName-x86_64-pc-windows-msvc.zip"
+    try {
+        $sums = (Invoke-WebRequest -Uri $sumsUrl -UseBasicParsing).Content
+    } catch {
+        Warn "Could not fetch checksums.txt ($($_.Exception.Message)) - skipping verification"
+        return
+    }
+
+    $expected = ($sums -split "`n") |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_.EndsWith($asset) } |
+        ForEach-Object { ($_ -split '\s+')[0] } |
+        Select-Object -First 1
+
+    if (-not $expected) {
+        throw "checksums.txt has no entry for ${asset} - refusing to install"
+    }
+
+    $actual = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $expected.ToLowerInvariant()) {
+        throw "Checksum mismatch for ${asset}`n  expected: $expected`n  actual:   $actual"
+    }
+    Ok "Checksum verified"
+}
+
 function Install-Binary {
     param([string]$ReleaseVersion)
 
@@ -145,6 +180,7 @@ function Install-Binary {
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 
     Invoke-WebRequest -Uri $url -OutFile $tempFile -UseBasicParsing
+    Test-ArchiveChecksum -ArchivePath $tempFile -ReleaseVersion $ReleaseVersion
     Expand-Archive -Path $tempFile -DestinationPath $InstallDir -Force
     Remove-Item $tempFile -Force
 

@@ -8,12 +8,12 @@ A tiny CLI that runs GGUF models through llama.cpp Docker servers with automatic
 
 ```bash
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/aditya-xq/llmr/develop/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aditya-xq/llmr/main/install.sh | sh
 ```
 
 ```powershell
 # Windows PowerShell
-irm https://raw.githubusercontent.com/aditya-xq/llmr/develop/install.ps1 | iex
+irm https://raw.githubusercontent.com/aditya-xq/llmr/main/install.ps1 | iex
 ```
 
 Or build from source:
