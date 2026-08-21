@@ -21,3 +21,9 @@ updates:
       interval: weekly
     commit-message:
       prefix: chore(ci)
+    groups:
+      actions:
+        update-types:
+          - major
+          - minor
+          - patch

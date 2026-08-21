@@ -251,3 +251,19 @@ src/
 ## Workflow: Verify File Existence with git ls-files, Not Glob
 - **Situation**: Checking whether repo files (e.g., `.github/` workflows) exist before creating or overwriting them
 - **Lesson**: Glob-style tools can skip dot-directories; always confirm with `git ls-files <dir>` before assuming a path is new, or you may silently clobber tracked automation
+
+## Pitfalls: Dependabot Reads Config from the Default Branch
+- **Situation**: Changing `dependabot.yml` (e.g., `target-branch`, grouping) on develop only
+- **Lesson**: Version-update config is read from the default branch; fixes must land on main before Dependabot behaves differently, or it keeps opening PRs the old way (against main, ungrouped)
+
+## Pitfalls: Workflow Reruns Replay the Original Event Payload
+- **Situation**: A check failed, you added a fix (label, env var), then `gh run rerun --failed`
+- **Lesson**: Reruns reuse the original event payload, so label/contains checks still see the old state. Query the live API inside the step (`gh pr view --json labels`) or trigger a fresh event (close/reopen, new push)
+
+## Pitfalls: Squash Merges Poison Tag-Based Commit Ranges
+- **Situation**: Deriving semver from `git log <last-tag>..HEAD` when develop→main PRs are squash-merged
+- **Lesson**: Develop's original commits are never ancestors of main's squashes, so they reappear in every future range. Keep develop == main + new work: after each squash release merge, let Sync Develop land and reset develop onto main if unique history diverges. Release Train labels its own PRs `skip-version-check` because it computes the bump itself
+
+## Patterns: Consolidating Workflows Must Preserve Job Names
+- **Situation**: Merging small workflow files into one (e.g., gate-main.yml + version-check.yml → main-gate.yml)
+- **Lesson**: Required status checks reference job names, not files; keep `name:` of jobs identical when consolidating to avoid editing branch protection

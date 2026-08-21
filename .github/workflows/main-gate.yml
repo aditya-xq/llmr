@@ -1,4 +1,4 @@
-name: Version Check
+name: Main Gate
 
 on:
   pull_request:
@@ -9,6 +9,22 @@ permissions:
   pull-requests: read
 
 jobs:
+  develop-only:
+    name: develop-only
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Verify source branch is develop
+        run: |
+          head_repo="${{ github.event.pull_request.head.repo.full_name }}"
+          head_ref="${{ github.event.pull_request.head.ref }}"
+          if [ "$head_ref" = "develop" ] && [ "$head_repo" = "${{ github.repository }}" ]; then
+            echo "OK: ${head_repo}:${head_ref} may merge into main"
+          else
+            echo "::error::Only ${{ github.repository }}:develop may be merged into main (got ${head_repo}:${head_ref})"
+            exit 1
+          fi
+
   release-version:
     name: release-version
     runs-on: ubuntu-latest

@@ -6,18 +6,24 @@ This guide explains how releases work — in plain language — for maintainers 
 
 ## For Maintainers: How to Cut a Release
 
-### The normal way: merge your release PR
+### The normal way: one command, then one click
 
-1. **Prepare develop** — Land all features on develop as usual. When a batch is ready for release, set the version in `Cargo.toml` to the next version (e.g., `1.2.0`).
-2. **Raise the release PR** — Open a PR from `develop` to `main`. CI validates the whole batch. Only `develop` may be merged into `main`; any other source branch is blocked by a required check.
-3. **Merge it** — Merging triggers everything automatically:
-   - The **Tag Release** workflow sees the new version in `Cargo.toml`, creates the `v1.2.0` tag on main, and starts the pipeline.
+1. **Land your work on develop** — commit in conventional style (`feat:`, `fix:`, ...). That's all the preparation there is; no manual version bumping.
+2. **Run the Release Train** — Actions tab → **Release Train** → *Run workflow* (or `gh workflow run release-train.yml`). It:
+   - derives the semver bump from conventional commits since the last tag,
+   - updates `Cargo.toml` + `Cargo.lock` on develop and pushes `chore(release): vX.Y.Z`,
+   - opens (or refreshes) the release PR to `main` with auto-merge armed.
+   Once checks pass, the PR merges itself.
+3. **Merging triggers everything automatically:**
+   - The **Tag Release** workflow sees the new version in `Cargo.toml`, creates the `vX.Y.Z` tag on main, and starts the pipeline.
    - The **Release** workflow builds 5 targets in parallel (Windows x64, Linux x64/arm64, macOS x64/arm64), packages each as `llmr-<target-triple>.<zip|tar.gz>` with sha256 checksums, and opens a **draft** GitHub release.
    - The **Sync Develop** workflow merges main back into develop, so the next cycle starts clean.
 4. **You review** — Open the draft on the [Releases page](https://github.com/aditya-xq/llmr/releases), read the notes, and click **Publish** when happy. Nothing is public until you do this.
 5. **Automatic verification** — Publishing triggers the **Release Verify** workflow, which checks that every download link actually works.
 
-If you forgot to bump `Cargo.toml` before merging, nothing happens (the tag already exists) — just run `./scripts/bump.ps1 X.Y.Z -Push` on main to cut the release manually.
+Release PRs carry the `skip-version-check` label by design: the Release Train itself computed the version from the same commits, so the redundant check is skipped. For hand-made release PRs, leave the label off and CI will verify your `Cargo.toml` bump instead.
+
+Prefer doing it by hand? Bump `Cargo.toml` yourself, open develop→main without the label, and let the **release-version** check validate it. If a release PR was merged without a bump, run `./scripts/bump.ps1 X.Y.Z -Push` on main to cut it manually.
 
 ### Choosing major, minor, or patch
 
@@ -130,7 +136,7 @@ Requires Rust 1.75+.
 
 | Task | Command |
 |---|---|
-| Release a new version | `./scripts/bump.ps1 X.Y.Z -Push` |
+| Release a new version | Run **Release Train** workflow (Actions tab or `gh workflow run release-train.yml`) |
 | Test the pipeline safely | Run Release workflow manually (dry-run) |
 | Check release status | Actions tab → Release / Release Verify workflows |
 | Install latest | See installer commands above |

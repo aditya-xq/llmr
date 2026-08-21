@@ -166,8 +166,7 @@ fn detect_cpu(system: &mut System) -> CpuInfo {
     let threads = cpus.len() as u32;
 
     // Try to get physical core count
-    let cores = system
-        .physical_core_count()
+    let cores = System::physical_core_count()
         .map(|c| c as u32)
         .unwrap_or(threads);
 
