@@ -21,6 +21,47 @@ Categories: `Code Style`, `Patterns`, `Pitfalls`, `Workflow`
 
 ---
 
+## Release & Commit Discipline (REQUIRED)
+
+CI derives releases from git history and `Cargo.toml`. These rules are load-bearing — violating them breaks releases or blocks PRs.
+
+### Commit messages (enforced by the `commit-lint` CI job)
+- Format: `<type>(<scope>)?: <imperative summary>` — e.g., `feat(cli): add --port flag`
+- Allowed types: `feat` `feature` `fix` `perf` `revert` `chore` `docs` `style` `refactor` `test` `build` `ci`
+- Breaking changes: append `!` before the colon (`feat!:`) **or** add a `BREAKING CHANGE: <what>` line in the body. Nothing else produces a major bump.
+- Semver impact: `feat` → minor, `fix`/`perf` → patch, everything else → no release impact
+- Never use `--no-verify`; never rewrite pushed history on shared branches
+
+### Branches
+- Feature work: short-lived branch → PR into `develop`
+- Releases: PR from `develop` into `main` — the only permitted source branch (CI-gated)
+- Never push directly to `main`
+
+### Versions
+- Bump `Cargo.toml` when preparing a release batch, matching what the batch's commits imply: breaking → major, any `feat` → minor, only `fix`/`perf` → patch, chores/docs/ci only → no bump. Commit `Cargo.lock` alongside.
+- `release-version` check enforces exact agreement; override only with the `skip-version-check` label on the release PR
+- Tags and releases are created by CI from `Cargo.toml`. Do not hand-create tags (`scripts/bump.ps1` on main is the one sanctioned manual path)
+
+### Before every push
+```bash
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --locked --lib
+```
+CI requires all three; failing them wastes a round-trip.
+
+### Workflows you interact with
+| Workflow | Trigger | Effect |
+|---|---|---|
+| `check.yml` | PRs | fmt, clippy `-D warnings`, test compile, unit tests, commit-lint, security audit |
+| `gate-main.yml` | PRs to main | rejects source branches other than `develop` |
+| `version-check.yml` | PRs to main | validates Cargo.toml against commit-derived semver |
+| `tag-release.yml` | push to main | tags unreleased versions, starts release build |
+| `sync-develop.yml` | push to main | back-merges main into develop |
+| `release.yml` / `release-verify.yml` | new tag / publish | draft release with 5-platform artifacts / URL verification |
+
+Full release procedure: [docs/RELEASING.md](docs/RELEASING.md).
+
+---
+
 ## Engineering Standards
 
 ### Design
