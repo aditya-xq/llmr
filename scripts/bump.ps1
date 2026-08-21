@@ -81,7 +81,7 @@ if ($PSCmdlet.ShouldProcess($projectRoot, "commit version bump and create tag $t
     git -C $projectRoot commit -m "chore(release): $tag"
     if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
 
-    git -C $projectRoot tag $tag
+    git -C $projectRoot tag -a $tag -m "Release $tag"
     if ($LASTEXITCODE -ne 0) { throw "git tag $tag failed (already exists?)" }
 
     Write-Host "Created commit and tag $tag"
@@ -89,10 +89,13 @@ if ($PSCmdlet.ShouldProcess($projectRoot, "commit version bump and create tag $t
 
 if ($Push) {
     if ($PSCmdlet.ShouldProcess("origin", "push $tag")) {
-        git -C $projectRoot push origin HEAD --follow-tags
+        git -C $projectRoot push origin HEAD
+        if ($LASTEXITCODE -ne 0) { throw "git push failed" }
+        git -C $projectRoot push origin $tag
+        if ($LASTEXITCODE -ne 0) { throw "git push $tag failed" }
         Write-Host "Pushed; Release workflow will start: https://github.com/aditya-xq/llmr/actions"
     }
 }
 else {
-    Write-Host "`nNext: git push origin HEAD --follow-tags"
+    Write-Host "`nNext: git push origin HEAD && git push origin $tag"
 }
