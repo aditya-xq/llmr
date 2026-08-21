@@ -360,12 +360,12 @@ impl ServeCommand {
         if !path.exists() {
             return Err(Error::ModelNotFound {
                 path: model_path.to_string(),
-            })?;
+            });
         }
         if !path.is_file() {
             return Err(Error::InvalidModelPath {
                 path: model_path.to_string(),
-            })?;
+            });
         }
 
         Ok(model_path.to_string())

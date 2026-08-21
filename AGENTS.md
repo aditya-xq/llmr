@@ -197,3 +197,16 @@ src/
 - **Situation**: Waiting for a local server or container to become ready after startup
 - **Lesson**: Start with short health-check intervals and bounded request timeouts, then back off to slower polling; avoid coarse fixed sleeps that add avoidable latency after the service is already ready
 - **Example**: For `serve`, poll `/health` immediately and every few hundred milliseconds during the initial startup window instead of waiting two seconds between attempts
+
+## Pitfalls: Release Artifact Names Are a Contract with Installers
+- **Situation**: Changing how release assets are named or packaged
+- **Lesson**: `install.sh`/`install.ps1` build download URLs from Rust target triples (`llmr-<triple>.tar.gz|zip`, binary at archive root); any producer of release assets must match that contract exactly or users get 404s
+- **Example**: `release.ps1` once produced `llmr-windows-x86_64.zip` while installers requested `llmr-x86_64-pc-windows-msvc.zip`
+
+## Workflow: WhatIf Does Not Stop Native Commands
+- **Situation**: Adding `-WhatIf` support to PowerShell scripts that call native executables (cargo, git, docker)
+- **Lesson**: Cmdlets honor propagated WhatIf preference, but native exes do not; guard native calls behind `if ($WhatIfPreference)` checks
+
+## Workflow: Verify File Existence with git ls-files, Not Glob
+- **Situation**: Checking whether repo files (e.g., `.github/` workflows) exist before creating or overwriting them
+- **Lesson**: Glob-style tools can skip dot-directories; always confirm with `git ls-files <dir>` before assuming a path is new, or you may silently clobber tracked automation

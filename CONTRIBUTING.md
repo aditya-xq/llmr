@@ -35,6 +35,10 @@ RUST_LOG=debug cargo run -- serve --model /path/to/model.gguf --dry-run
 6. Push to your fork
 7. Submit a pull request
 
+## CI
+
+Every PR runs `cargo fmt --check`, `cargo clippy -- -D warnings`, compiles all test suites, executes Docker-free unit tests, and runs a dependency security audit (see `.github/workflows/check.yml`). Integration/e2e tests that require Docker are not run in CI — run them locally with `cargo test`.
+
 ## Commit Messages
 
 - Use clear, descriptive messages
