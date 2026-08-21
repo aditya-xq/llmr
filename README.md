@@ -146,14 +146,8 @@ cargo test
 
 ## Releasing (maintainers)
 
-Releases are fully automated via GitHub Actions — triggered by pushing a `v*` tag:
+Releases are automated: bump the version in `Cargo.toml` on `develop`, merge the release PR into `main`, and CI does the rest — tags, 5-target builds with sha256 checksums, and a **draft** GitHub release for you to review and publish. Only `develop` may be merged into `main`, and main is synced back into develop automatically after every merge.
 
-```bash
-./scripts/bump.ps1 1.2.0 -Push   # bump Cargo.toml, commit, tag, push
-```
-
-The pipeline then: validates the tag matches `Cargo.toml`, builds 5 targets in parallel (Windows x64, Linux x64/arm64, macOS x64/arm64), packages each as `llmr-<target-triple>.<zip|tar.gz>` with sha256 checksums, and opens a **draft** GitHub release. Review and publish the draft; a follow-up workflow verifies every asset URL is downloadable.
-
-`scripts/release.ps1` remains available for local packaging smoke tests. To test pipeline changes without cutting a release, run the Release workflow manually from the Actions tab (dry-run mode).
+Manual fallback: `./scripts/bump.ps1 1.2.0 -Push` on main. To test pipeline changes without cutting a release, run the Release workflow manually from the Actions tab (dry-run mode).
 
 Full step-by-step guide for maintainers and end users: [docs/RELEASING.md](docs/RELEASING.md).

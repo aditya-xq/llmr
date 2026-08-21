@@ -6,25 +6,24 @@ This guide explains how releases work — in plain language — for maintainers 
 
 ## For Maintainers: How to Cut a Release
 
-You need one command:
+### The normal way: merge your release PR
 
-```powershell
-./scripts/bump.ps1 1.2.3 -Push
-```
+1. **Prepare develop** — Land all features on develop as usual. When a batch is ready for release, set the version in `Cargo.toml` to the next version (e.g., `1.2.0`).
+2. **Raise the release PR** — Open a PR from `develop` to `main`. CI validates the whole batch. Only `develop` may be merged into `main`; any other source branch is blocked by a required check.
+3. **Merge it** — Merging triggers everything automatically:
+   - The **Tag Release** workflow sees the new version in `Cargo.toml`, creates the `v1.2.0` tag on main, and starts the pipeline.
+   - The **Release** workflow builds 5 targets in parallel (Windows x64, Linux x64/arm64, macOS x64/arm64), packages each as `llmr-<target-triple>.<zip|tar.gz>` with sha256 checksums, and opens a **draft** GitHub release.
+   - The **Sync Develop** workflow merges main back into develop, so the next cycle starts clean.
+4. **You review** — Open the draft on the [Releases page](https://github.com/aditya-xq/llmr/releases), read the notes, and click **Publish** when happy. Nothing is public until you do this.
+5. **Automatic verification** — Publishing triggers the **Release Verify** workflow, which checks that every download link actually works.
 
-That's it. Here is what happens, step by step:
+If you forgot to bump `Cargo.toml` before merging, nothing happens (the tag already exists) — just run `./scripts/bump.ps1 X.Y.Z -Push` on main to cut the release manually.
 
-1. **Version bump** — The script sets the version in `Cargo.toml` to `1.2.3`, refreshes `Cargo.lock`, commits as `chore(release): v1.2.3`, creates an annotated git tag `v1.2.3`, and pushes both to GitHub.
-2. **CI validates** — Pushing the tag starts the **Release** workflow. First it checks that the tag matches the version in `Cargo.toml` (if they don't match, everything stops — no bad release can happen) and that the code compiles.
-3. **Five builds in parallel** — GitHub's servers build llmr for every supported platform at once:
-   - Windows x64
-   - Linux x64 and Linux ARM64
-   - macOS Intel and macOS Apple Silicon
+### Rules to remember
 
-   Each build produces a package named after its Rust target triple, for example `llmr-x86_64-pc-windows-msvc.zip`, plus a sha256 checksum file.
-4. **Draft release** — All packages are collected, a `checksums.txt` is generated, and a **draft** (private, not yet public) GitHub release is created with automatic release notes.
-5. **You review** — Open the draft on the [Releases page](https://github.com/aditya-xq/llmr/releases), read the notes, and click **Publish** when happy. Nothing is public until you do this.
-6. **Automatic verification** — Publishing triggers the **Release Verify** workflow, which checks that every download link actually works. If any asset is broken, CI turns red immediately.
+- All changes reach main **through develop**. Direct pushes to main will break the sync job loudly — by design.
+- `Cargo.toml` is the single source of truth for versions. Bump it as part of release prep; never edit tags by hand.
+- Never edit an already-published release's assets. Cut a new version instead.
 
 ### Testing pipeline changes (without releasing)
 
@@ -35,12 +34,6 @@ In the GitHub Actions tab, run the **Release** workflow manually with dry-run en
 - **Build failure on one platform**: check the Actions log for that matrix job; fix and push a new tag.
 - **Wrong version tagged**: delete the tag (`git push origin :refs/tags/vX.Y.Z` and `git tag -d vX.Y.Z`), fix the version, re-tag. Draft releases from failed attempts should be deleted manually.
 - **A download link is broken after publishing**: Release Verify will show exactly which asset failed.
-
-### Rules to remember
-
-- `Cargo.toml` is the single source of truth for versions. Never edit tags by hand without bumping it.
-- Releases only happen through tags. Merging to `main` does nothing by itself.
-- Never edit an already-published release's assets. Cut a new version instead.
 
 ---
 
