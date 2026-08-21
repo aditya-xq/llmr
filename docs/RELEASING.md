@@ -16,14 +16,14 @@ This guide explains how releases work — in plain language — for maintainers 
    Once checks pass, the PR merges itself.
 3. **Merging triggers everything automatically:**
    - The **Tag Release** workflow sees the new version in `Cargo.toml`, creates the `vX.Y.Z` tag on main, and starts the pipeline.
-   - The **Release** workflow builds 5 targets in parallel (Windows x64, Linux x64/arm64, macOS x64/arm64), packages each as `llmr-<target-triple>.<zip|tar.gz>` with sha256 checksums, and opens a **draft** GitHub release.
+   - The **Release** workflow builds 5 targets in parallel (Windows x64, Linux x64/arm64, macOS x64/arm64), packages each as `llmr-<target-triple>.<zip|tar.gz>` with sha256 checksums and signed build-provenance attestations, and opens a **draft** GitHub release.
    - The **Sync Develop** workflow merges main back into develop, so the next cycle starts clean.
 4. **You review** — Open the draft on the [Releases page](https://github.com/aditya-xq/llmr/releases), read the notes, and click **Publish** when happy. Nothing is public until you do this.
 5. **Automatic verification** — Publishing triggers the **Release Verify** workflow, which checks that every download link actually works.
 
 Release PRs carry the `skip-version-check` label by design: the Release Train itself computed the version from the same commits, so the redundant check is skipped. For hand-made release PRs, leave the label off and CI will verify your `Cargo.toml` bump instead.
 
-Prefer doing it by hand? Bump `Cargo.toml` yourself, open develop→main without the label, and let the **release-version** check validate it. If a release PR was merged without a bump, run `./scripts/bump.ps1 X.Y.Z -Push` on main to cut it manually.
+Prefer doing it by hand? Bump `Cargo.toml` yourself, open develop→main without the label, and let the **release-version** check validate it. If a release PR was merged without a bump (tag already exists, nothing fires), cut it manually: `git tag -a vX.Y.Z <main-sha> -m "Release vX.Y.Z" && git push origin vX.Y.Z` — the Release workflow builds on the tag push.
 
 ### Choosing major, minor, or patch
 
@@ -41,7 +41,7 @@ The PR cannot merge until `Cargo.toml` matches what the commits say — so write
 ### Rules to remember
 
 - All changes reach main **through develop**. Direct pushes to main will break the sync job loudly — by design.
-- `Cargo.toml` is the single source of truth for versions. Bump it as part of release prep; never edit tags by hand.
+- `Cargo.toml` is the single source of truth for versions. The Release Train bumps it for you; on hand-made release PRs, bump it as part of release prep. Never edit an existing tag in place — recovery is delete + re-tag (see "If something fails").
 - Never edit an already-published release's assets. Cut a new version instead.
 
 ### Testing pipeline changes (without releasing)
